@@ -248,6 +248,23 @@ nohup setsid --fork --wait KOBE denovo_detect_map \
     > "/path/to/denovo_detect_map.log" 2>&1 < /dev/null &
 ```
 
+## 2.7. Uninstall KOBE
+
+To remove KOBE command links, run:
+
+```bash
+bash /path/to/KOBE_v1.0.0/KOBE/uninstall.sh
+```
+
+If a custom command directory was used, specify the same `RNA_EDITING_BIN_DIR`:
+
+```bash
+RNA_EDITING_BIN_DIR="/path/to/custom/bin" \
+bash /path/to/KOBE_v1.0.0/KOBE/uninstall.sh
+```
+
+**Note:** This script removes KOBE command links only. The software directory, container image, and project data are not deleted.
+
 ---
 
 # 3. De Novo RNA Editing Identification
