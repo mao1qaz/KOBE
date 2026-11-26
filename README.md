@@ -257,7 +257,7 @@ KOBE conserve_plot \
 
 The results are saved in `quick_test_output/`.
 
-For detailed instructions, parameter descriptions, and input/output formats, see the [KOBE User Manual (PDF)](docs/KOBE_User_Manual.pdf) or [Markdown version](docs/KOBE_User_Manual.md).
+For detailed instructions, parameter descriptions, and input/output formats, see the [KOBE User Manual](docs/KOBE_User_Manual.md).
 
 ## 5. Citation
 
