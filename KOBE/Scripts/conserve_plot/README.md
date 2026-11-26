@@ -6,16 +6,16 @@ This package provides three independent commands:
 2. `add_new_site`: add recovered sites to the original homologous groups using the original `transcript:cds_pos` matching logic.
 3. `find_back_plot`: run the supplementary extraction, filtering, and plotting workflow using the updated annotation CSV.
 
-The analysis and site-matching logic is retained. Changes are limited to explicit input/output paths, Apptainer execution, and use of Times New Roman fonts bundled in the container.
+The analysis and site-matching logic is retained. Changes are limited to explicit input/output paths, Apptainer execution, and use of Liberation Serif fonts installed in the container.
 
 ## Requirements
 
 - Apptainer
-- An RNA Editing SIF containing the Python environment and these four font files:
-  - `/opt/rna_editing/fonts/Times.TTF`
-  - `/opt/rna_editing/fonts/Timesbd.TTF`
-  - `/opt/rna_editing/fonts/Timesi.TTF`
-  - `/opt/rna_editing/fonts/Timesbi.TTF`
+- An RNA Editing SIF containing the Python environment and the `fonts-liberation2` package. The four Liberation Serif font files are expected at:
+  - `/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf`
+  - `/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf`
+  - `/usr/share/fonts/truetype/liberation2/LiberationSerif-Italic.ttf`
+  - `/usr/share/fonts/truetype/liberation2/LiberationSerif-BoldItalic.ttf`
 - The analysis dependencies used by the scripts, including pandas and matplotlib. The summary step no longer requires the `venn` package.
 
 The launchers automatically bind the script directory and the parent directories of input files, plus the CDS and output directories, at their original absolute paths inside the container. No `--bind` argument is required for the listed inputs.
@@ -83,7 +83,7 @@ The log is written directly under `--outdir` as `find_back_plot.log`. Results ar
 ## Notes
 
 - All path inputs are explicit; the scripts do not derive project paths from a fixed server directory.
-- The font directory is fixed inside the SIF at `/opt/rna_editing/fonts`; no host font directory is mounted.
+- The font directory is fixed inside the SIF at `/usr/share/fonts/truetype/liberation2`; no host font directory is mounted.
 - Existing result files with the same names are overwritten as in the original scripts. Choose a new `--outdir` to retain previous results.
 - `--help` is available for all three commands.
 

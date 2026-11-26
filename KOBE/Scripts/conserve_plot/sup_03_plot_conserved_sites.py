@@ -50,14 +50,14 @@ species_order = [x.strip() for x in args.species_order.split(",") if x.strip()]
 if not species_order or len(species_order) != len(set(species_order)):
     raise SystemExit("--species_order must contain unique species names")
 
-font_dir = Path("/opt/rna_editing/fonts")
-regular_path = font_dir / "Times.TTF"
-bold_path = font_dir / "Timesbd.TTF"
-italic_path = font_dir / "Timesi.TTF"
-bold_italic_path = font_dir / "Timesbi.TTF"
+font_dir = Path("/usr/share/fonts/truetype/liberation2")
+regular_path = font_dir / "LiberationSerif-Regular.ttf"
+bold_path = font_dir / "LiberationSerif-Bold.ttf"
+italic_path = font_dir / "LiberationSerif-Italic.ttf"
+bold_italic_path = font_dir / "LiberationSerif-BoldItalic.ttf"
 for path in (regular_path, bold_path, italic_path, bold_italic_path):
     if not path.is_file():
-        raise FileNotFoundError(f"Container font file not found: {path}")
+        raise FileNotFoundError(f"Container Liberation Serif font file not found: {path}")
     font_manager.fontManager.addfont(str(path))
 FONT_REGULAR = font_manager.FontProperties(fname=str(regular_path))
 FONT_BOLD = font_manager.FontProperties(fname=str(bold_path))
