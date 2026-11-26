@@ -1,0 +1,713 @@
+import csv
+import hashlib
+import json
+import os
+import re
+import shutil
+from pathlib import Path
+
+
+# ============================================================
+# Base Extraction workflow
+# Original analysis order and output semantics are preserved.
+# ============================================================
+
+
+def cfg(key, default=None):
+    return config.get(key, default)
+
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def strip_quotes(value):
+    value = str(value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1].strip()
+    return value
+
+
+def resolve_path(value, label, must_exist=True, base_dir=None):
+    value = strip_quotes(value)
+    if not value:
+        raise ValueError(f"{label} is empty.")
+    path = Path(value).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = Path(base_dir) / path
+    path = path.resolve()
+    if must_exist and not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+    return str(path)
+
+
+def safe_name(value, field, line_number):
+    value = (value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+        raise ValueError(
+            f"Invalid {field} '{value}' at sample-table line {line_number}."
+        )
+    return value
+
+
+WORK_DIR = str(Path(cfg("work_dir")).expanduser().resolve())
+SAMPLES_TSV = resolve_path(cfg("samples_tsv"), "sample table")
+GTF_DIR = resolve_path(cfg("gtf_dir"), "GTF directory", must_exist=False)
+SITE_DIR = resolve_path(cfg("site_dir"), "known-site directory", must_exist=False)
+REUSE_BAM = as_bool(cfg("reuse_bam", False))
+RESUME_MODE = as_bool(cfg("resume_mode", False))
+REUSE_BAM_MANIFEST = str(cfg("reuse_bam_manifest", ""))
+REUSE_BAM_KEYS = set()
+if REUSE_BAM:
+    if not REUSE_BAM_MANIFEST or not Path(REUSE_BAM_MANIFEST).is_file():
+        raise FileNotFoundError(f"Reuse-BAM manifest not found: {REUSE_BAM_MANIFEST}")
+    with open(REUSE_BAM_MANIFEST, encoding="utf-8") as handle:
+        _reuse_data = json.load(handle)
+    REUSE_BAM_KEYS = {(row["species"], row["sample_id"]) for row in _reuse_data.get("reused", [])}
+
+TOOLS = {
+    "fastp": cfg("tool_fastp"),
+    "star": cfg("tool_star"),
+    "samtools": cfg("tool_samtools"),
+    "redi_python": cfg("tool_redi_python"),
+    "reditool_known": cfg("tool_reditool_known"),
+    "picard": cfg("tool_picard"),
+    "java": cfg("tool_java"),
+}
+
+for tool_name, tool_path in TOOLS.items():
+    if not tool_path or not os.path.isfile(tool_path):
+        raise FileNotFoundError(
+            f"Container software '{tool_name}' not found: {tool_path}"
+        )
+
+JAVA = TOOLS["java"]
+PICARD_MEM_MB = int(cfg("picard_memory_mb", 81200))
+PICARD_HEAP_G = max(1, PICARD_MEM_MB // 1024)
+
+THREADS = {
+    "reference_prepare": int(cfg("reference_prepare_threads", 2)),
+    "fastp": int(cfg("fastp_threads", 10)),
+    "star_index": int(cfg("star_index_threads", 15)),
+    "star": int(cfg("star_threads", 15)),
+    "samtools": int(cfg("samtools_threads", 10)),
+    "picard_index": int(cfg("picard_index_threads", 2)),
+    "reditools": int(cfg("reditools_threads", 2)),
+}
+
+MEMORY_MB = {
+    "reference_prepare": int(cfg("reference_prepare_memory_mb", 6000)),
+    "fastp": int(cfg("fastp_memory_mb", 4000)),
+    "star_index": int(cfg("star_index_memory_mb", 64000)),
+    "star_map": int(cfg("star_map_memory_mb", 16000)),
+    "q10": int(cfg("q10_memory_mb", 8000)),
+    "picard": PICARD_MEM_MB,
+    "reditools": int(cfg("reditools_memory_mb", 12000)),
+}
+
+FASTP_CFG = {
+    "n_base_limit": int(cfg("fastp_n_base_limit", 5)),
+    "qualified_quality_phred": int(cfg("fastp_qualified_quality", 15)),
+    "unqualified_percent_limit": int(cfg("fastp_unqualified_percent", 50)),
+    "length_required": cfg("fastp_length_required", 150),
+    "disable_trim_poly_g": as_bool(cfg("fastp_disable_trim_poly_g", True)),
+}
+if str(FASTP_CFG["length_required"]).strip().lower() in {"none", "off", "null", ""}:
+    FASTP_CFG["length_required"] = None
+else:
+    FASTP_CFG["length_required"] = int(FASTP_CFG["length_required"])
+
+STAR_CFG = {
+    "sjdb_overhang": int(cfg("star_sjdb_overhang", 149)),
+    "limit_genome_generate_ram": int(cfg("star_limit_genome_generate_ram", 60000000000)),
+    "limit_bam_sort_ram": int(cfg("star_limit_bam_sort_ram", 12884901888)),
+    "genome_sa_index_nbases": str(cfg("star_genome_sa_index_nbases", "auto")),
+    "multimap_max": int(cfg("star_multimap_max", 1)),
+    "mismatch_max": int(cfg("star_mismatch_max", 10)),
+    "twopass_mode": str(cfg("star_twopass_mode", "Basic")),
+    "out_reads_unmapped": str(cfg("star_out_reads_unmapped", "Fastx")),
+}
+
+Q10_MAPQ = int(cfg("q10_mapq", 10))
+REDI_CFG = {
+    "min_coverage": int(cfg("reditools_min_coverage", 1)),
+    "min_base_quality": int(cfg("reditools_min_base_quality", 25)),
+    "min_mapping_quality": int(cfg("reditools_min_mapq", 10)),
+    "min_variant_reads": int(cfg("reditools_min_variant_reads", 0)),
+    "min_editing_frequency": float(cfg("reditools_min_editing_frequency", 0.0)),
+}
+PICARD_CFG = {
+    "remove_duplicates": as_bool(cfg("picard_remove_duplicates", True)),
+    "create_index": as_bool(cfg("picard_create_index", True)),
+    "assume_sorted": as_bool(cfg("picard_assume_sorted", True)),
+    "validation_stringency": str(cfg("picard_validation_stringency", "SILENT")),
+}
+
+
+# ============================================================
+# Read and validate sample table
+# ============================================================
+
+
+def read_samples(path):
+    samples = {}
+    species_info = {}
+
+    with open(path, encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if not reader.fieldnames:
+            raise ValueError("Sample table has no header.")
+        reader.fieldnames = [x.strip().lstrip("\ufeff") for x in reader.fieldnames]
+
+        required = {"sample_id", "species", "fq1", "fq2"}
+        missing = required - set(reader.fieldnames)
+        genome_col = next((x for x in ("genome_fasta", "genome", "reference_fasta", "ref") if x in reader.fieldnames), None)
+        if missing or genome_col is None:
+            raise ValueError("Sample table must contain sample_id, species, fq1, fq2, and genome_fasta (or genome/ref).")
+
+        for line_number, raw in enumerate(reader, start=2):
+            if not raw or not any((value or "").strip() for value in raw.values()):
+                continue
+
+            sample_id = safe_name(raw.get("sample_id"), "sample_id", line_number)
+            species = safe_name(raw.get("species"), "species", line_number)
+
+            if "type" in raw and (raw.get("type") or "").strip():
+                sample_type = raw["type"].strip().upper()
+                if sample_type != "RNA":
+                    raise ValueError(f"Only RNA samples are accepted: {species}/{sample_id}, type={sample_type}")
+
+            fq_paths = {}
+            for column in ("fq1", "fq2"):
+                value = strip_quotes(raw.get(column))
+                if not value:
+                    if not (REUSE_BAM or RESUME_MODE):
+                        raise ValueError(f"Empty {column}: {species}/{sample_id}; FASTQ can be omitted only when reusable BAMs or retained clean FASTQs are available in resume/reuse mode.")
+                    fq_paths[column] = ""
+                    continue
+                resolved = resolve_path(value, f"{column} for {species}/{sample_id}", must_exist=False, base_dir=Path(path).parent)
+                if not os.path.isfile(resolved) and not (REUSE_BAM or RESUME_MODE):
+                    raise FileNotFoundError(f"Missing {column} for {species}/{sample_id}: {resolved}")
+                fq_paths[column] = resolved
+
+            genome = resolve_path(raw.get(genome_col), f"genome_fasta for {species}/{sample_id}", base_dir=Path(path).parent)
+            key = (species, sample_id)
+            if key in samples:
+                raise ValueError(f"Duplicate sample: {species}/{sample_id}")
+            if species in species_info and species_info[species]["genome"] != genome:
+                raise ValueError(f"Different genome FASTA files detected within species {species}.")
+
+            samples[key] = {**fq_paths, "genome": genome}
+            species_info.setdefault(species, {"genome": genome})
+
+    if not samples:
+        raise ValueError("No RNA samples found.")
+    return samples, species_info
+
+
+SAMPLES, SPECIES_INFO = read_samples(SAMPLES_TSV)
+SPECIES = sorted(SPECIES_INFO)
+if REUSE_BAM:
+    for (species, sample_id), sample in SAMPLES.items():
+        if (species, sample_id) not in REUSE_BAM_KEYS:
+            raw_pair_ok = bool(
+                sample["fq1"] and sample["fq2"]
+                and os.path.isfile(sample["fq1"]) and os.path.isfile(sample["fq2"])
+            )
+            clean_r1 = Path(WORK_DIR) / species / "00_QC" / sample_id / "qc.R1.fastq.gz"
+            clean_r2 = Path(WORK_DIR) / species / "00_QC" / sample_id / "qc.R2.fastq.gz"
+            clean_pair_ok = bool(
+                clean_r1.is_file() and clean_r1.stat().st_size > 0
+                and clean_r2.is_file() and clean_r2.stat().st_size > 0
+            )
+            if not raw_pair_ok and not clean_pair_ok:
+                raise FileNotFoundError(
+                    f"No reusable Picard BAM was accepted and neither a complete raw FASTQ pair "
+                    f"nor a retained clean FASTQ pair is available for {species}/{sample_id}. "
+                    f"fq1={sample['fq1'] or '[empty]'}; fq2={sample['fq2'] or '[empty]'}; "
+                    f"clean_R1={clean_r1}; clean_R2={clean_r2}"
+                )
+SAMPLES_BY_SPECIES = {
+    sp: [sample_id for species, sample_id in SAMPLES if species == sp]
+    for sp in SPECIES
+}
+
+for sp in SPECIES:
+    gtf = Path(GTF_DIR) / f"{sp}.gtf"
+    sites = Path(SITE_DIR) / f"{sp}_known_sites.tsv"
+    if not gtf.is_file():
+        raise FileNotFoundError(f"GTF not found for species '{sp}': {gtf}")
+    if not sites.is_file():
+        raise FileNotFoundError(f"Known-site table not found for species '{sp}': {sites}")
+    SPECIES_INFO[sp]["gtf"] = str(gtf.resolve())
+    SPECIES_INFO[sp]["sites"] = str(sites.resolve())
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+print("========== Base Extraction inputs ==========")
+print(f"Work directory: {WORK_DIR}")
+print(f"Sample table: {SAMPLES_TSV}")
+print(f"Resume mode: {RESUME_MODE}")
+print(f"Reuse BAM mode: {REUSE_BAM}")
+for sp in SPECIES:
+    print(f"\nSpecies: {sp}")
+    print(f"Genome: {SPECIES_INFO[sp]['genome']}")
+    print(f"GTF: {SPECIES_INFO[sp]['gtf']}")
+    print(f"Known sites: {SPECIES_INFO[sp]['sites']}")
+    print(f"Samples: {len(SAMPLES_BY_SPECIES[sp])}")
+    for sample_id in SAMPLES_BY_SPECIES[sp]:
+        sample = SAMPLES[(sp, sample_id)]
+        print(f"  {sample_id}: fq1={sample['fq1'] or '[not supplied]'}; fq2={sample['fq2'] or '[not supplied]'}")
+print("============================================")
+
+
+def sample_path(wildcards, key):
+    return SAMPLES[(wildcards.sp, wildcards.sample_id)][key]
+
+
+def fastp_input_paths(wildcards):
+    sample = SAMPLES[(wildcards.sp, wildcards.sample_id)]
+    fq1, fq2 = sample["fq1"], sample["fq2"]
+    if fq1 and fq2 and Path(fq1).is_file() and Path(fq2).is_file():
+        return [fq1, fq2]
+    clean_r1 = Path(WORK_DIR) / wildcards.sp / "00_QC" / wildcards.sample_id / "qc.R1.fastq.gz"
+    clean_r2 = Path(WORK_DIR) / wildcards.sp / "00_QC" / wildcards.sample_id / "qc.R2.fastq.gz"
+    if (REUSE_BAM or RESUME_MODE) and clean_r1.is_file() and clean_r1.stat().st_size > 0 and clean_r2.is_file() and clean_r2.stat().st_size > 0:
+        return []
+    raise FileNotFoundError(
+        f"No complete raw FASTQ pair or retained clean FASTQ pair for "
+        f"{wildcards.sp}/{wildcards.sample_id}."
+    )
+
+
+def use_retained_clean_fastq(wildcards):
+    sample = SAMPLES[(wildcards.sp, wildcards.sample_id)]
+    raw_pair_ok = bool(
+        sample["fq1"] and sample["fq2"]
+        and Path(sample["fq1"]).is_file() and Path(sample["fq2"]).is_file()
+    )
+    clean_r1 = Path(WORK_DIR) / wildcards.sp / "00_QC" / wildcards.sample_id / "qc.R1.fastq.gz"
+    clean_r2 = Path(WORK_DIR) / wildcards.sp / "00_QC" / wildcards.sample_id / "qc.R2.fastq.gz"
+    use_clean = (not raw_pair_ok) and clean_r1.is_file() and clean_r1.stat().st_size > 0 and clean_r2.is_file() and clean_r2.stat().st_size > 0
+    return "true" if use_clean else "false"
+
+
+def species_path(wildcards, key):
+    return SPECIES_INFO[wildcards.sp][key]
+
+
+def sample_uses_reused_bam(wildcards):
+    return REUSE_BAM and (wildcards.sp, wildcards.sample_id) in REUSE_BAM_KEYS
+
+
+def reditool_bam_path(wildcards):
+    if sample_uses_reused_bam(wildcards):
+        return f"{WORK_DIR}/.reuse_bam_inputs/{wildcards.sp}/{wildcards.sample_id}.sort.q10.nodup.bam"
+    return f"{WORK_DIR}/{wildcards.sp}/03_PICARD/{wildcards.sample_id}/{wildcards.sample_id}.sort.q10.nodup.bam"
+
+
+def reditool_bai_path(wildcards):
+    return reditool_bam_path(wildcards) + ".bai"
+
+
+def reuse_validation_path(wildcards):
+    if sample_uses_reused_bam(wildcards):
+        return f"{WORK_DIR}/.reuse_bam_validated/{wildcards.sp}/{wildcards.sample_id}.ok"
+    return []
+
+
+FINAL_FILES = [
+    f"{WORK_DIR}/{sp}/06_ALL_SAMPLES/{sp}_all_samples_base_counts.tsv"
+    for sp in SPECIES
+]
+
+
+rule all:
+    input:
+        FINAL_FILES
+
+
+# ============================================================
+# Reference preparation
+# ============================================================
+
+rule prepare_reference:
+    input:
+        genome=lambda wc: species_path(wc, "genome")
+    output:
+        fasta=f"{WORK_DIR}/{{sp}}/00_REF/GENOME/{{sp}}.fa",
+        fai=f"{WORK_DIR}/{{sp}}/00_REF/GENOME/{{sp}}.fa.fai"
+    params:
+        samtools=TOOLS["samtools"]
+    threads: THREADS["reference_prepare"]
+    resources:
+        mem_mb=MEMORY_MB["reference_prepare"]
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.fasta:q})"
+        ln -sfn {input.genome:q} {output.fasta:q}
+        {params.samtools:q} faidx {output.fasta:q}
+        test -s {output.fai:q}
+        """
+
+
+# ============================================================
+# STAR genome index
+# ============================================================
+
+rule star_index:
+    input:
+        fasta=f"{WORK_DIR}/{{sp}}/00_REF/GENOME/{{sp}}.fa",
+        fai=f"{WORK_DIR}/{{sp}}/00_REF/GENOME/{{sp}}.fa.fai",
+        gtf=lambda wc: species_path(wc, "gtf")
+    output:
+        star=directory(f"{WORK_DIR}/{{sp}}/00_REF/STAR")
+    params:
+        star=TOOLS["star"],
+        sjdb_overhang=STAR_CFG["sjdb_overhang"],
+        genome_ram=STAR_CFG["limit_genome_generate_ram"],
+        sa_index_config=STAR_CFG["genome_sa_index_nbases"]
+    threads: THREADS["star_index"]
+    resources:
+        mem_mb=MEMORY_MB["star_index"]
+    shell:
+        r"""
+        set -euo pipefail
+        rm -rf {output.star:q}
+        mkdir -p {output.star:q}
+        if [ {params.sa_index_config:q} = "auto" ]; then
+            SA_INDEX=$(awk '{{sum+=$2}} END {{x=int(log(sum)/log(2)/2-1); if (x<1) x=1; if (x>14) x=14; print x}}' {input.fai:q})
+        else
+            SA_INDEX={params.sa_index_config}
+        fi
+        echo "STAR genomeSAindexNbases: $SA_INDEX"
+        {params.star:q} --runMode genomeGenerate \
+            --runThreadN {threads} \
+            --genomeDir {output.star:q} \
+            --genomeFastaFiles {input.fasta:q} \
+            --sjdbGTFfile {input.gtf:q} \
+            --sjdbOverhang {params.sjdb_overhang} \
+            --limitGenomeGenerateRAM {params.genome_ram} \
+            --genomeSAindexNbases "$SA_INDEX"
+        """
+
+
+# ============================================================
+# Prepare REDItoolKnown site list
+# ============================================================
+
+rule prepare_known_sites:
+    input:
+        sites=lambda wc: species_path(wc, "sites"),
+        fai=f"{WORK_DIR}/{{sp}}/00_REF/GENOME/{{sp}}.fa.fai"
+    output:
+        redi=f"{WORK_DIR}/{{sp}}/00_INPUT/known_sites.redi.tab",
+        metadata=f"{WORK_DIR}/{{sp}}/00_INPUT/site_metadata.tsv"
+    params:
+        script=str(Path(workflow.basedir) / "prepare_known_sites.py"),
+        site_sha256=lambda wc: sha256_file(species_path(wc, "sites"))
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.redi:q})"
+        echo "Known-site SHA256: {params.site_sha256}"
+        python3 {params.script:q} \
+            --input {input.sites:q} \
+            --fai {input.fai:q} \
+            --redi-output {output.redi:q} \
+            --metadata-output {output.metadata:q}
+        test -s {output.redi:q}
+        test -s {output.metadata:q}
+        python3 -c 'import sys; f=open(sys.argv[1], "rb"); magic=f.read(2); f.close(); assert magic != bytes([31, 139]), "Expected uncompressed TSV"' {output.redi:q}
+        test ! -e {output.redi:q}.gz
+        test ! -e {output.redi:q}.gz.tbi
+        """
+
+
+# ============================================================
+# FASTQ quality control
+# ============================================================
+
+rule fastp:
+    input:
+        fastqs=lambda wc: fastp_input_paths(wc)
+    output:
+        r1=f"{WORK_DIR}/{{sp}}/00_QC/{{sample_id}}/qc.R1.fastq.gz",
+        r2=f"{WORK_DIR}/{{sp}}/00_QC/{{sample_id}}/qc.R2.fastq.gz"
+    params:
+        html=lambda wc: f"{WORK_DIR}/{wc.sp}/00_QC/{wc.sample_id}/qc.html",
+        json=lambda wc: f"{WORK_DIR}/{wc.sp}/00_QC/{wc.sample_id}/qc.json",
+        fq1=lambda wc: sample_path(wc, "fq1"),
+        fq2=lambda wc: sample_path(wc, "fq2"),
+        use_retained_clean=use_retained_clean_fastq,
+        fastp=TOOLS["fastp"],
+        n=FASTP_CFG["n_base_limit"],
+        q=FASTP_CFG["qualified_quality_phred"],
+        u=FASTP_CFG["unqualified_percent_limit"],
+        extra_args=" ".join(x for x in (
+            f"-l {FASTP_CFG['length_required']}" if FASTP_CFG["length_required"] is not None else "",
+            "-G" if FASTP_CFG["disable_trim_poly_g"] else ""
+        ) if x)
+    log:
+        f"{WORK_DIR}/logs/{{sp}}/{{sample_id}}.fastp.log"
+    threads: THREADS["fastp"]
+    resources:
+        mem_mb=MEMORY_MB["fastp"]
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.r1:q})" "$(dirname {log:q})"
+        if [ {params.use_retained_clean:q} = "true" ]; then
+            test -s {output.r1:q}
+            test -s {output.r2:q}
+            gzip -t {output.r1:q} {output.r2:q}
+            echo "Using retained clean FASTQ pair; fastp was not rerun." > {log:q}
+        else
+            {params.fastp:q} \
+                -n {params.n} \
+                -q {params.q} \
+                -u {params.u} {params.extra_args} \
+                --thread {threads} \
+                -i {params.fq1:q} \
+                -I {params.fq2:q} \
+                -o {output.r1:q} \
+                -O {output.r2:q} \
+                --html {params.html:q} \
+                --json {params.json:q} \
+                > {log:q} 2>&1
+        fi
+        """
+
+
+# ============================================================
+# STAR mapping
+# ============================================================
+
+rule star_map:
+    input:
+        r1=f"{WORK_DIR}/{{sp}}/00_QC/{{sample_id}}/qc.R1.fastq.gz",
+        r2=f"{WORK_DIR}/{{sp}}/00_QC/{{sample_id}}/qc.R2.fastq.gz",
+        star=f"{WORK_DIR}/{{sp}}/00_REF/STAR"
+    output:
+        bam=f"{WORK_DIR}/{{sp}}/01_MAP/{{sample_id}}/{{sample_id}}.sort.bam"
+    params:
+        star=TOOLS["star"],
+        tmp=lambda wc: f"{WORK_DIR}/tmp/STAR/{wc.sp}/{wc.sample_id}",
+        prefix=lambda wc: f"{WORK_DIR}/{wc.sp}/01_MAP/{wc.sample_id}/{wc.sample_id}_",
+        sort_ram=STAR_CFG["limit_bam_sort_ram"],
+        multimap_max=STAR_CFG["multimap_max"],
+        mismatch_max=STAR_CFG["mismatch_max"],
+        twopass=STAR_CFG["twopass_mode"],
+        unmapped_arg=(f"--outReadsUnmapped {STAR_CFG['out_reads_unmapped']}" if STAR_CFG["out_reads_unmapped"].lower() not in {"none", "off", "false"} else "")
+    log:
+        f"{WORK_DIR}/logs/{{sp}}/{{sample_id}}.STAR.log"
+    threads: THREADS["star"]
+    resources:
+        mem_mb=MEMORY_MB["star_map"]
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.bam:q})" "$(dirname {log:q})" "$(dirname {params.tmp:q})"
+        rm -rf {params.tmp:q}
+        {params.star:q} --runThreadN {threads} \
+            --readFilesCommand zcat \
+            --outSAMtype BAM SortedByCoordinate {params.unmapped_arg} \
+            --outFilterMultimapNmax {params.multimap_max} \
+            --outFilterMismatchNmax {params.mismatch_max} \
+            --twopassMode {params.twopass} \
+            --limitBAMsortRAM {params.sort_ram} \
+            --genomeDir {input.star:q} \
+            --readFilesIn {input.r1:q} {input.r2:q} \
+            --outFileNamePrefix {params.prefix:q} \
+            --outSAMattrRGline ID:{wildcards.sample_id} SM:{wildcards.sample_id} \
+            --outTmpDir {params.tmp:q} \
+            > {log:q} 2>&1
+        mv {params.prefix:q}Aligned.sortedByCoord.out.bam {output.bam:q}
+        """
+
+
+# ============================================================
+# MAPQ filtering
+# ============================================================
+
+rule q10_filter:
+    input:
+        bam=f"{WORK_DIR}/{{sp}}/01_MAP/{{sample_id}}/{{sample_id}}.sort.bam"
+    output:
+        bam=f"{WORK_DIR}/{{sp}}/02_Q10/{{sample_id}}/{{sample_id}}.sort.q10.bam",
+        bai=f"{WORK_DIR}/{{sp}}/02_Q10/{{sample_id}}/{{sample_id}}.sort.q10.bam.bai"
+    params:
+        samtools=TOOLS["samtools"],
+        mapq=Q10_MAPQ
+    threads: THREADS["samtools"]
+    resources:
+        mem_mb=MEMORY_MB["q10"]
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.bam:q})"
+        {params.samtools:q} view -bh -q {params.mapq} {input.bam:q} \
+            | {params.samtools:q} sort -@ {threads} -o {output.bam:q} -
+        {params.samtools:q} index -@ {threads} {output.bam:q} {output.bai:q}
+        {params.samtools:q} quickcheck -v {output.bam:q}
+        """
+
+
+# ============================================================
+# Picard duplicate removal
+# ============================================================
+
+rule picard_mark_duplicates:
+    input:
+        bam=f"{WORK_DIR}/{{sp}}/02_Q10/{{sample_id}}/{{sample_id}}.sort.q10.bam",
+        bai=f"{WORK_DIR}/{{sp}}/02_Q10/{{sample_id}}/{{sample_id}}.sort.q10.bam.bai"
+    output:
+        bam=f"{WORK_DIR}/{{sp}}/03_PICARD/{{sample_id}}/{{sample_id}}.sort.q10.nodup.bam",
+        bai=f"{WORK_DIR}/{{sp}}/03_PICARD/{{sample_id}}/{{sample_id}}.sort.q10.nodup.bam.bai",
+        metrics=f"{WORK_DIR}/{{sp}}/03_PICARD/{{sample_id}}/{{sample_id}}.picard.metrics.txt"
+    params:
+        java=JAVA,
+        picard=TOOLS["picard"],
+        heap_g=PICARD_HEAP_G,
+        tmp=lambda wc: f"{WORK_DIR}/tmp/Picard/{wc.sp}/{wc.sample_id}",
+        picard_index=lambda wc: f"{WORK_DIR}/{wc.sp}/03_PICARD/{wc.sample_id}/{wc.sample_id}.sort.q10.nodup.bai",
+        samtools=TOOLS["samtools"],
+        create_index=str(PICARD_CFG["create_index"]).lower(),
+        remove_duplicates=str(PICARD_CFG["remove_duplicates"]).lower(),
+        assume_sorted=str(PICARD_CFG["assume_sorted"]).lower(),
+        validation_stringency=PICARD_CFG["validation_stringency"],
+        index_threads=THREADS["picard_index"]
+    threads: 1
+    resources:
+        mem_mb=MEMORY_MB["picard"]
+    log:
+        f"{WORK_DIR}/logs/{{sp}}/{{sample_id}}.Picard.log"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.bam:q})" "$(dirname {log:q})" {params.tmp:q}
+        rm -f {output.bam:q} {output.bai:q} {params.picard_index:q} {output.metrics:q}
+        {params.java:q} -Xmx{params.heap_g}g -jar {params.picard:q} MarkDuplicates \
+            TMP_DIR={params.tmp:q} \
+            INPUT={input.bam:q} \
+            OUTPUT={output.bam:q} \
+            METRICS_FILE={output.metrics:q} \
+            VALIDATION_STRINGENCY={params.validation_stringency} \
+            ASSUME_SORTED={params.assume_sorted} \
+            CREATE_INDEX={params.create_index} \
+            REMOVE_DUPLICATES={params.remove_duplicates} \
+            > {log:q} 2>&1
+        test -s {output.bam:q}
+        test -s {output.metrics:q}
+        if [ -s {output.bai:q} ]; then
+            :
+        elif [ -s {params.picard_index:q} ]; then
+            mv {params.picard_index:q} {output.bai:q}
+        else
+            {params.samtools:q} index -@ {params.index_threads} -o {output.bai:q} {output.bam:q}
+        fi
+        {params.samtools:q} quickcheck -v {output.bam:q}
+        test -s {output.bai:q}
+        if ! {params.samtools:q} idxstats {output.bam:q} >/dev/null 2>&1; then
+            rm -f {output.bai:q} {params.picard_index:q}
+            {params.samtools:q} index -@ {params.index_threads} -o {output.bai:q} {output.bam:q}
+        fi
+        {params.samtools:q} idxstats {output.bam:q} >/dev/null
+        """
+
+
+# ============================================================
+# Reused-BAM validation markers are generated by the single
+# pre-Snakemake validate_reuse_bam.py helper.
+# ============================================================
+
+
+# ============================================================
+# REDItoolKnown; one independent Snakemake job per sample
+# ============================================================
+
+rule reditool_known:
+    input:
+        bam=lambda wc: reditool_bam_path(wc),
+        bai=lambda wc: reditool_bai_path(wc),
+        validation=reuse_validation_path,
+        fasta=f"{WORK_DIR}/{{sp}}/00_REF/GENOME/{{sp}}.fa",
+        fai=f"{WORK_DIR}/{{sp}}/00_REF/GENOME/{{sp}}.fa.fai",
+        sites=f"{WORK_DIR}/{{sp}}/00_INPUT/known_sites.redi.tab"
+    output:
+        result=directory(f"{WORK_DIR}/{{sp}}/04_REDItools/{{sample_id}}")
+    params:
+        python=TOOLS["redi_python"],
+        script=TOOLS["reditool_known"],
+        min_coverage=REDI_CFG["min_coverage"],
+        min_base_quality=REDI_CFG["min_base_quality"],
+        min_mapq=REDI_CFG["min_mapping_quality"],
+        min_variant_reads=REDI_CFG["min_variant_reads"],
+        min_editing_frequency=REDI_CFG["min_editing_frequency"]
+    threads: THREADS["reditools"]
+    resources:
+        mem_mb=MEMORY_MB["reditools"]
+    log:
+        f"{WORK_DIR}/logs/{{sp}}/{{sample_id}}.REDItoolKnown.log"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.result:q})" "$(dirname {log:q})"
+        rm -rf {output.result:q}
+        mkdir -p {output.result:q}
+        cp {input.sites:q} {output.result:q}/known_sites.redi.tab
+        {params.python:q} {params.script:q} \
+            -i {input.bam:q} \
+            -f {input.fasta:q} \
+            -l {output.result:q}/known_sites.redi.tab \
+            -t {threads} \
+            -o {output.result:q} \
+            -c {params.min_coverage} \
+            -q {params.min_base_quality} \
+            -m {params.min_mapq} \
+            -v {params.min_variant_reads} \
+            -n {params.min_editing_frequency} \
+            > {log:q} 2>&1
+        if ! find {output.result:q} -type f -name 'outTable_*' -size +0c -print -quit | grep -q .; then
+            echo "ERROR: REDItoolKnown produced no non-empty outTable files." >&2
+            exit 1
+        fi
+        """
+
+
+# ============================================================
+# Merge all samples of each species into one wide count table
+# ============================================================
+
+rule merge_all_samples:
+    input:
+        redi_dirs=lambda wc: [f"{WORK_DIR}/{wc.sp}/04_REDItools/{sample_id}" for sample_id in SAMPLES_BY_SPECIES[wc.sp]],
+        metadata=f"{WORK_DIR}/{{sp}}/00_INPUT/site_metadata.tsv",
+        samples=SAMPLES_TSV
+    output:
+        table=f"{WORK_DIR}/{{sp}}/06_ALL_SAMPLES/{{sp}}_all_samples_base_counts.tsv"
+    params:
+        script=str(Path(workflow.basedir) / "merge_all_sample_base_counts.py"),
+        input_dir=lambda wc: f"{WORK_DIR}/{wc.sp}/04_REDItools"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.table:q})"
+        python3 {params.script:q} \
+            --sample-table {input.samples:q} \
+            --metadata {input.metadata:q} \
+            --input-dir {params.input_dir:q} \
+            --species {wildcards.sp:q} \
+            --output {output.table:q}
+        test -s {output.table:q}
+        """

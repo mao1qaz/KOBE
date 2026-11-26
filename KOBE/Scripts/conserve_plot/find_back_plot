@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_container_runner.sh"
+
+ANNOTATED=""; CDS_DIR=""; OUT_DIR=""; SIF="${RNA_EDITING_SIF:-}"
+GROUP_COL=""; MIN_SPECIES=""; SPECIES_ORDER=""; SOURCE_PRIORITY=""; NCOLS=8
+BIND_PATHS=("$SCRIPT_DIR")
+
+usage() {
+    cat <<'EOF'
+Usage:
+  find_back_plot --annotated FILE --cds_dir DIR --outdir DIR \
+    --group_col STRING --min_species INT \
+    --species_order STRING --sif FILE \
+    [--source_priority STRING] [--col INT] [--bind DIR ...]
+
+The updated annotation CSV is normally produced by add_new_site.
+The log and all analysis results are written directly under --outdir.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --annotated) ANNOTATED="$2"; BIND_PATHS+=("$2"); shift 2 ;;
+        --cds_dir) CDS_DIR="$2"; BIND_PATHS+=("$2"); shift 2 ;;
+        --outdir) OUT_DIR="$2"; shift 2 ;;
+        --sif) SIF="$2"; shift 2 ;;
+        --group_col) GROUP_COL="$2"; shift 2 ;;
+        --min_species) MIN_SPECIES="$2"; shift 2 ;;
+        --species_order) SPECIES_ORDER="$2"; shift 2 ;;
+        --source_priority) SOURCE_PRIORITY="$2"; shift 2 ;;
+        --col) NCOLS="$2"; shift 2 ;;
+        --bind) BIND_PATHS+=("$2"); shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$ANNOTATED" || -z "$CDS_DIR" || -z "$OUT_DIR" || -z "$SIF" || -z "$GROUP_COL" || -z "$MIN_SPECIES" || -z "$SPECIES_ORDER" ]]; then
+    echo "ERROR: Missing required arguments." >&2
+    usage >&2
+    exit 1
+fi
+
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/find_back_plot.log"
+BIND_PATHS+=("$OUT_DIR")
+CMD=(bash "$SCRIPT_DIR/sup_main.sh" --annotated "$ANNOTATED" --cds_dir "$CDS_DIR" \
+    --outdir "$OUT_DIR" --group_col "$GROUP_COL" --min_species "$MIN_SPECIES" \
+    --species_order "$SPECIES_ORDER" --ncols "$NCOLS")
+if [[ -n "$SOURCE_PRIORITY" ]]; then CMD+=(--source_priority "$SOURCE_PRIORITY"); fi
+
+run_in_container_logged "$SIF" "$LOG_FILE" "${BIND_PATHS[@]}" -- "${CMD[@]}"

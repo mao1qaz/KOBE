@@ -1,0 +1,648 @@
+# Module 02: RNA editing discovery, annotation, and regional filtering.
+# Module 03: final A-to-I site export and mutation-type proportion summary.
+#
+# Run parameters are supplied directly by denovo_detect_anno; no YAML config
+# files are read. Existing annotated VCFs and candidate tables are reused.
+
+import csv
+import os
+import shlex
+import subprocess
+from collections import Counter
+
+
+def as_bool(value, default=False):
+    """Parse YAML booleans and Snakemake CLI string booleans safely."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
+WORK_DIR = os.path.abspath(config["work_dir"])
+SCRIPT_DIR = os.path.abspath(workflow.basedir)
+OUT_DIR = os.path.join(WORK_DIR, "02_anno")
+FINAL_OUT_DIR = os.path.join(WORK_DIR, "edit_site_result")
+MAP_DIR = os.path.join(WORK_DIR, "01_MAP")
+MAP_REF_DIR = os.path.join(WORK_DIR, "00_REF", "GENOME")
+SAMPLES_TSV = os.path.abspath(config["samples_tsv"])
+SAMTOOLS = config.get("samtools", "samtools")
+PYTHON = config.get("python", "python3")
+RSCRIPT = config.get("rscript", "Rscript")
+
+RNA_HOME = os.environ.get("RNA_EDITING_HOME", "/opt/rna_editing")
+SNPEFF_ROOT_VALUE = str(config.get("snpeff_dir", "")).strip()
+SNPEFF_ROOT = os.path.abspath(SNPEFF_ROOT_VALUE) if SNPEFF_ROOT_VALUE else ""
+SNPEFF_DATA = os.path.join(SNPEFF_ROOT, "database") if SNPEFF_ROOT else ""
+SNPEFF_CONFIG_DIR = os.path.join(SNPEFF_ROOT, "config") if SNPEFF_ROOT else ""
+JAR = os.path.abspath(
+    config.get("snpeff_jar") or os.path.join(RNA_HOME, "jars", "snpEff.jar")
+)
+JAVA = config.get("snpeff_java") or os.path.join(RNA_HOME, "bin", "java25")
+
+MP_MIN_BQ = int(config.get("min_base_quality", 30))
+MP_OPTIONS = str(config.get("mpileup_options", "-u -v -t ADF,ADR"))
+MP_MEMORY_MB = int(config.get("mpileup_memory_mb", 12000))
+ANN_OPTIONS = str(config.get("snpeff_options", "-canon -ud 0 -v -nodownload -noLog"))
+ANN_HEAP = str(config.get("snpeff_heap", "8g"))
+ANN_MEMORY_MB = int(config.get("snpeff_memory_mb", 12000))
+
+DNA_MIN = int(config.get("dna_min_coverage", 10))
+RNA_MIN = int(config.get("rna_min_coverage", 5))
+DNA_FDR_CUTOFF = float(config.get("dna_fdr", 0.05))
+RNA_FDR_CUTOFF = float(config.get("rna_fdr", 0.05))
+ERROR_RATE = float(config.get("total_error_rate", 0.005))
+MIN_SUPPORT = int(config.get("min_support", 2))
+GENIC_MODE = str(config.get("genic_mode", "c_numeric"))
+ACCEPT_SIMPLE_SNV = int(as_bool(config.get("accept_simple_snv", True), default=True))
+FILTER_ONLY = as_bool(config.get("filter_only", False))
+FORCE_REANNOTATE = as_bool(config.get("reannotate", False))
+
+if FILTER_ONLY and FORCE_REANNOTATE:
+    raise ValueError("--filter-only and --reannotate cannot be used together")
+
+# Preserve the established five-field threshold naming convention.
+# total_error_rate is intentionally not included in the filename tag.
+THRESHOLD_TAG = (
+    f"DNA{DNA_MIN}_RNA{RNA_MIN}_NRNA{MIN_SUPPORT}"
+    f"_DNAFDR{DNA_FDR_CUTOFF:g}_RNAFDR{RNA_FDR_CUTOFF:g}"
+)
+
+MP_ARGS = " ".join(shlex.quote(x) for x in shlex.split(MP_OPTIONS))
+ANN_ARGS = " ".join(shlex.quote(x) for x in shlex.split(ANN_OPTIONS))
+
+PARSER = os.path.join(SCRIPT_DIR, "02_parse_vcf.py")
+R_FILTER = os.path.join(SCRIPT_DIR, "02_filter_plot.R")
+EXPORT_SCRIPT = os.path.join(SCRIPT_DIR, "03_export_final_edit_sites.py")
+
+for required_script in (PARSER, R_FILTER, EXPORT_SCRIPT):
+    if not os.path.isfile(required_script):
+        raise FileNotFoundError(f"Required script not found: {required_script}")
+if not os.path.isfile(SAMPLES_TSV):
+    raise FileNotFoundError(f"Sample table not found: {SAMPLES_TSV}")
+
+# Read sample identity. sample_id must be globally unique.
+SAMPLES = []
+SEEN_IDS = set()
+with open(SAMPLES_TSV, newline="", encoding="utf-8-sig") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+    required_columns = {"sample_id", "sample_name", "species", "type"}
+    if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
+        raise ValueError(
+            "samples.tsv requires sample_id, sample_name, species, and type columns"
+        )
+
+    for line_num, row in enumerate(reader, 2):
+        sid = (row.get("sample_id") or "").strip()
+        sample_name = (row.get("sample_name") or "").strip()
+        species = (row.get("species") or "").strip()
+        typ = (row.get("type") or "").strip().upper()
+
+        if not sid or not sample_name or not species or typ not in {"DNA", "RNA"}:
+            raise ValueError(f"Invalid sample metadata at samples.tsv line {line_num}")
+        if any(char in sid + species for char in "/\\,\t\n "):
+            raise ValueError(f"Invalid sample_id or species at samples.tsv line {line_num}")
+        if any(char in sample_name for char in "\t\n"):
+            raise ValueError(f"Invalid sample_name at samples.tsv line {line_num}")
+        if sid in SEEN_IDS:
+            raise ValueError(f"sample_id must be globally unique; duplicate: {sid}")
+
+        SEEN_IDS.add(sid)
+        SAMPLES.append({
+            "sample_id": sid,
+            "sample_name": sample_name,
+            "species": species,
+            "type": typ,
+        })
+
+SPECIES_CONFIG = config.get("species")
+if isinstance(SPECIES_CONFIG, str):
+    SPECIES_CONFIG = [x.strip() for x in SPECIES_CONFIG.split(",") if x.strip()]
+SPECIES = sorted(set(SPECIES_CONFIG or [row["species"] for row in SAMPLES]))
+if not SPECIES:
+    raise ValueError("No species selected for analysis")
+
+for sp in SPECIES:
+    subset = [row for row in SAMPLES if row["species"] == sp]
+    if not subset:
+        raise ValueError(f"Species {sp} is not present in Module 01 samples.tsv")
+    if not {"DNA", "RNA"}.issubset({row["type"] for row in subset}):
+        raise ValueError(f"At least one DNA and one RNA sample are required for {sp}")
+
+    rna_names = {row["sample_name"] for row in subset if row["type"] == "RNA"}
+    dna_names = {row["sample_name"] for row in subset if row["type"] == "DNA"}
+    unmatched = sorted(rna_names - dna_names)
+    if unmatched:
+        raise ValueError(f"RNA sample_name values without matched DNA libraries in {sp}: {unmatched}")
+
+
+def sample_rows(sp):
+    return sorted(
+        (row for row in SAMPLES if row["species"] == sp),
+        key=lambda row: (0 if row["type"] == "DNA" else 1, row["sample_id"]),
+    )
+
+
+def mapping_bam(row):
+    sp, sid = row["species"], row["sample_id"]
+    if row["type"] == "DNA":
+        return os.path.join(MAP_DIR, sp, "DNA", sid, f"{sid}.nodup.bam")
+    return os.path.join(MAP_DIR, sp, "RNA", "final", sid, "split.bam")
+
+
+def species_bams(wildcards):
+    return [mapping_bam(row) for row in sample_rows(wildcards.sp)]
+
+
+def species_bais(wildcards):
+    return [mapping_bam(row) + ".bai" for row in sample_rows(wildcards.sp)]
+
+
+def sample_csv(wildcards, sample_type):
+    return ",".join(
+        row["sample_id"]
+        for row in sample_rows(wildcards.sp)
+        if row["type"] == sample_type
+    )
+
+
+# Annotated VCFs and unfiltered candidate tables are reusable across thresholds.
+# --reannotate explicitly forces only SnpEff annotation and candidate extraction.
+ANNOTATED_VCFS = {
+    sp: os.path.join(OUT_DIR, sp, "DNA_RNA.var.snpeff.vcf")
+    for sp in SPECIES
+}
+MISSING_ANNOTATED_VCFS = [
+    (sp, path)
+    for sp, path in ANNOTATED_VCFS.items()
+    if not os.path.isfile(path) or os.path.getsize(path) == 0
+]
+NEED_ANNOTATION = FORCE_REANNOTATE or bool(MISSING_ANNOTATED_VCFS)
+
+if NEED_ANNOTATION and not FILTER_ONLY:
+    if not SNPEFF_ROOT:
+        raise ValueError(
+            "SnpEff annotation is required, but no database directory was supplied. "
+            "Pass --snpeff-dir DIR to denovo_detect_anno. "
+            "The workflow does not infer project data paths from the KOBE installation "
+            "or from the work directory."
+        )
+    species_needing_annotation = (
+        SPECIES if FORCE_REANNOTATE else [sp for sp, _path in MISSING_ANNOTATED_VCFS]
+    )
+    missing_snpeff = []
+    for sp in species_needing_annotation:
+        db_file = os.path.join(SNPEFF_DATA, sp, "snpEffectPredictor.bin")
+        species_config = os.path.join(SNPEFF_CONFIG_DIR, f"{sp}.config")
+        if not os.path.isfile(db_file):
+            missing_snpeff.append((sp, "database", db_file))
+        if not os.path.isfile(species_config):
+            missing_snpeff.append((sp, "config", species_config))
+
+    if missing_snpeff:
+        details = "\n".join(f"  {sp} [{kind}]: {path}" for sp, kind, path in missing_snpeff)
+        raise ValueError(
+            "SnpEff database/configuration is missing for one or more selected species.\n"
+            f"SnpEff root searched: {SNPEFF_ROOT}\nMissing resources:\n{details}"
+        )
+    if not os.path.isfile(JAR):
+        raise FileNotFoundError(f"SnpEff JAR not found: {JAR}")
+
+MUTATION_TYPES = [
+    "A>C", "A>G", "A>T", "C>A", "C>G", "C>T",
+    "G>A", "G>C", "G>T", "T>A", "T>C", "T>G",
+]
+
+wildcard_constraints:
+    region="genic|intergenic"
+
+
+ANNOTATION_TARGETS = (
+    expand(os.path.join(OUT_DIR, "{sp}", "DNA_RNA.var.snpeff.vcf"), sp=SPECIES)
+    + expand(os.path.join(OUT_DIR, "{sp}", "genic.candidates.tsv"), sp=SPECIES)
+    + expand(os.path.join(OUT_DIR, "{sp}", "intergenic.candidates.tsv"), sp=SPECIES)
+)
+FILTER_TARGETS = (
+    expand(os.path.join(OUT_DIR, "{sp}", f"genic.{THRESHOLD_TAG}.with_stat.tsv"), sp=SPECIES)
+    + expand(os.path.join(OUT_DIR, "{sp}", f"intergenic.{THRESHOLD_TAG}.with_stat.tsv"), sp=SPECIES)
+    + expand(os.path.join(FINAL_OUT_DIR, "{sp}", f"genic.{THRESHOLD_TAG}.mutation_types.pdf"), sp=SPECIES)
+    + expand(os.path.join(FINAL_OUT_DIR, "{sp}", f"intergenic.{THRESHOLD_TAG}.mutation_types.pdf"), sp=SPECIES)
+    + expand(os.path.join(FINAL_OUT_DIR, "{sp}", f"genic.final_sites.{THRESHOLD_TAG}.tsv"), sp=SPECIES)
+    + expand(os.path.join(FINAL_OUT_DIR, "{sp}", f"intergenic.final_sites.{THRESHOLD_TAG}.tsv"), sp=SPECIES)
+    + expand(os.path.join(FINAL_OUT_DIR, "{sp}", f"all.final_sites.{THRESHOLD_TAG}.tsv"), sp=SPECIES)
+    + expand(os.path.join(FINAL_OUT_DIR, "{sp}", f"variant_type_proportion.{THRESHOLD_TAG}.tsv"), sp=SPECIES)
+)
+ALL_TARGETS = FILTER_TARGETS if FILTER_ONLY else ANNOTATION_TARGETS + FILTER_TARGETS
+
+rule all:
+    input:
+        ALL_TARGETS
+
+# Module 01 BAM header verification.
+rule validate_bam_samples:
+    input:
+        bams=species_bams,
+        bais=species_bais
+    output:
+        report=os.path.join(OUT_DIR, "{sp}", "sample_header_check.tsv")
+    run:
+        rows = sample_rows(wildcards.sp)
+        os.makedirs(os.path.dirname(output.report), exist_ok=True)
+        results = []
+
+        for row in rows:
+            bam = mapping_bam(row)
+            completed = subprocess.run(
+                [SAMTOOLS, "view", "-H", bam],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            sms = set()
+            for line in completed.stdout.splitlines():
+                if not line.startswith("@RG\t"):
+                    continue
+                for field in line.split("\t")[1:]:
+                    if field.startswith("SM:"):
+                        sms.add(field[3:])
+
+            if sms != {row["sample_id"]}:
+                raise ValueError(
+                    f"BAM sample mismatch: {bam}; expected SM={row['sample_id']}; "
+                    f"found={sorted(sms)}. Fix BAM Read Groups before running Module 02."
+                )
+            results.append((row, bam))
+
+        with open(output.report, "w", encoding="utf-8") as handle:
+            handle.write("sample_id\tsample_name\tspecies\ttype\tbam\tSM\n")
+            for row, bam in results:
+                handle.write(
+                    f"{row['sample_id']}\t{row['sample_name']}\t{row['species']}\t"
+                    f"{row['type']}\t{bam}\t{row['sample_id']}\n"
+                )
+
+
+# If the SnpEff VCF already exists, Snakemake reuses it and does not need
+# to schedule these upstream rules. If absent, the original upstream route remains.
+rule mpileup_vcf:
+    input:
+        fa=os.path.join(MAP_REF_DIR, "{sp}.fa"),
+        fai=os.path.join(MAP_REF_DIR, "{sp}.fa.fai"),
+        bams=species_bams,
+        bais=species_bais,
+        check=os.path.join(OUT_DIR, "{sp}", "sample_header_check.tsv")
+    output:
+        vcf=os.path.join(OUT_DIR, "{sp}", "DNA_RNA.vcf30.vcf")
+    params:
+        samtools=SAMTOOLS,
+        min_bq=MP_MIN_BQ,
+        opts=MP_ARGS
+    threads: 1
+    resources:
+        mem_mb=MP_MEMORY_MB
+    log:
+        os.path.join(OUT_DIR, "{sp}", "logs", "mpileup.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log:q})"
+        {params.samtools:q} mpileup -f {input.fa:q} -Q {params.min_bq} {params.opts} {input.bams:q} \
+            > {output.vcf:q} 2> {log:q}
+        test -s {output.vcf:q}
+        """
+
+
+rule normalize_candidate_vcf:
+    input:
+        vcf=os.path.join(OUT_DIR, "{sp}", "DNA_RNA.vcf30.vcf"),
+        script=PARSER
+    output:
+        vcf=os.path.join(OUT_DIR, "{sp}", "DNA_RNA.var.vcf")
+    params:
+        python=PYTHON,
+        dna=lambda wildcards: sample_csv(wildcards, "DNA"),
+        rna=lambda wildcards: sample_csv(wildcards, "RNA"),
+        accept_plain=ACCEPT_SIMPLE_SNV
+    log:
+        os.path.join(OUT_DIR, "{sp}", "logs", "normalize.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log:q})"
+        {params.python:q} {input.script:q} normalize \
+            --input {input.vcf:q} --output {output.vcf:q} \
+            --dna {params.dna:q} --rna {params.rna:q} \
+            --accept-plain {params.accept_plain} > {log:q} 2>&1
+        test -s {output.vcf:q}
+        """
+
+
+rule snpeff_annotate:
+    input:
+        vcf=os.path.join(OUT_DIR, "{sp}", "DNA_RNA.var.vcf"),
+        db=os.path.join(SNPEFF_DATA, "{sp}", "snpEffectPredictor.bin"),
+        config=os.path.join(SNPEFF_CONFIG_DIR, "{sp}.config"),
+        jar=JAR
+    output:
+        # Keep only the annotated VCF as a declared output. The HTML report is
+        # still generated, but a missing HTML file will not force re-annotation
+        # when an existing annotated VCF is being reused.
+        vcf=os.path.join(OUT_DIR, "{sp}", "DNA_RNA.var.snpeff.vcf")
+    params:
+        java=JAVA,
+        heap=ANN_HEAP,
+        data_dir=SNPEFF_DATA,
+        opts=ANN_ARGS,
+        stats=lambda wildcards: os.path.join(OUT_DIR, wildcards.sp, "DNA_RNA.snpeff_summary.html")
+    resources:
+        mem_mb=ANN_MEMORY_MB
+    log:
+        os.path.join(OUT_DIR, "{sp}", "logs", "snpeff.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log:q})"
+        {params.java:q} -Xmx{params.heap} -jar {input.jar:q} ann {params.opts} \
+            -c {input.config:q} -dataDir {params.data_dir:q} \
+            -stats {params.stats:q} {wildcards.sp} {input.vcf:q} \
+            > {output.vcf:q} 2> {log:q}
+        test -s {output.vcf:q}
+        """
+
+
+# Extract every annotated SNV and per-library REF/ALT count.
+# No DNA/RNA coverage threshold is applied in this rule.
+rule extract_regions_prefilter:
+    input:
+        vcf=os.path.join(OUT_DIR, "{sp}", "DNA_RNA.var.snpeff.vcf"),
+        script=PARSER
+    output:
+        genic=os.path.join(OUT_DIR, "{sp}", "genic.candidates.tsv"),
+        intergenic=os.path.join(OUT_DIR, "{sp}", "intergenic.candidates.tsv")
+    params:
+        python=PYTHON,
+        dna=lambda wildcards: sample_csv(wildcards, "DNA"),
+        rna=lambda wildcards: sample_csv(wildcards, "RNA"),
+        genic_mode=GENIC_MODE
+    log:
+        os.path.join(OUT_DIR, "{sp}", "logs", "extract_candidates.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log:q})"
+        tmp_genic="{output.genic}.tmp.$$"
+        tmp_intergenic="{output.intergenic}.tmp.$$"
+        trap 'rm -f "$tmp_genic" "$tmp_intergenic"' EXIT
+
+        {params.python:q} {input.script:q} extract \
+            --input {input.vcf:q} \
+            --genic "$tmp_genic" \
+            --intergenic "$tmp_intergenic" \
+            --dna {params.dna:q} \
+            --rna {params.rna:q} \
+            --genic-mode {params.genic_mode:q} > {log:q} 2>&1
+
+        test -s "$tmp_genic"
+        test -s "$tmp_intergenic"
+        mv -f "$tmp_genic" {output.genic:q}
+        mv -f "$tmp_intergenic" {output.intergenic:q}
+        trap - EXIT
+        """
+
+
+rule filter_and_plot_region:
+    input:
+        tsv=os.path.join(OUT_DIR, "{sp}", "{region}.candidates.tsv"),
+        script=R_FILTER
+    output:
+        stats=os.path.join(OUT_DIR, "{sp}", "{region}." + THRESHOLD_TAG + ".with_stat.tsv"),
+        filtered=temp(os.path.join(OUT_DIR, "{sp}", "{region}." + THRESHOLD_TAG + ".fdr05.tsv")),
+        supported=temp(os.path.join(OUT_DIR, "{sp}", "{region}." + THRESHOLD_TAG + ".supported.tsv")),
+        selected=temp(os.path.join(OUT_DIR, "{sp}", "{region}." + THRESHOLD_TAG + ".selected.tsv")),
+        pdf=os.path.join(FINAL_OUT_DIR, "{sp}", "{region}." + THRESHOLD_TAG + ".mutation_types.pdf"),
+        summary=temp(os.path.join(OUT_DIR, "{sp}", "{region}." + THRESHOLD_TAG + ".filter_summary.tsv")),
+        sample_summary=temp(os.path.join(OUT_DIR, "{sp}", "{region}." + THRESHOLD_TAG + ".sample_test_summary.tsv"))
+    params:
+        rscript=RSCRIPT,
+        prefix=lambda wildcards: os.path.join(
+            OUT_DIR, wildcards.sp, f"{wildcards.region}.{THRESHOLD_TAG}"
+        ),
+        sample_table=SAMPLES_TSV,
+        species=lambda wildcards: wildcards.sp,
+        dna_min=DNA_MIN,
+        dna_fdr=DNA_FDR_CUTOFF,
+        rna_min=RNA_MIN,
+        rna_fdr=RNA_FDR_CUTOFF,
+        error_rate=ERROR_RATE,
+        min_support=MIN_SUPPORT
+    log:
+        os.path.join(OUT_DIR, "{sp}", "logs", "{region}." + THRESHOLD_TAG + ".filter.log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log:q})" "$(dirname {output.pdf:q})"
+        tmp_prefix="{params.prefix}.tmp.$$"
+        trap 'rm -f "$tmp_prefix".*' EXIT
+
+        {params.rscript:q} {input.script:q} \
+            {input.tsv:q} "$tmp_prefix" {wildcards.region:q} \
+            {params.sample_table:q} {params.species:q} \
+            {params.dna_min} {params.dna_fdr} {params.rna_min} {params.rna_fdr} \
+            {params.error_rate} {params.min_support} > {log:q} 2>&1
+
+        for suffix in with_stat.tsv fdr05.tsv supported.tsv selected.tsv \
+                      mutation_types.pdf filter_summary.tsv sample_test_summary.tsv; do
+            test -s "$tmp_prefix.$suffix"
+        done
+
+        mv -f "$tmp_prefix.with_stat.tsv" {output.stats:q}
+        mv -f "$tmp_prefix.fdr05.tsv" {output.filtered:q}
+        mv -f "$tmp_prefix.supported.tsv" {output.supported:q}
+        mv -f "$tmp_prefix.selected.tsv" {output.selected:q}
+        mv -f "$tmp_prefix.mutation_types.pdf" {output.pdf:q}
+        mv -f "$tmp_prefix.filter_summary.tsv" {output.summary:q}
+        mv -f "$tmp_prefix.sample_test_summary.tsv" {output.sample_summary:q}
+        trap - EXIT
+        """
+
+
+rule combine_selected:
+    input:
+        genic=os.path.join(OUT_DIR, "{sp}", f"genic.{THRESHOLD_TAG}.selected.tsv"),
+        intergenic=os.path.join(OUT_DIR, "{sp}", f"intergenic.{THRESHOLD_TAG}.selected.tsv"),
+        script=PARSER
+    output:
+        summary=temp(os.path.join(OUT_DIR, "{sp}", f"combined_edit_summary.{THRESHOLD_TAG}.tsv"))
+    params:
+        python=PYTHON
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {output.summary:q})"
+        tmp_summary="{output.summary}.tmp.$$"
+        trap 'rm -f "$tmp_summary"' EXIT
+
+        {params.python:q} {input.script:q} combine \
+            --genic {input.genic:q} \
+            --intergenic {input.intergenic:q} \
+            --output "$tmp_summary"
+
+        test -s "$tmp_summary"
+        mv -f "$tmp_summary" {output.summary:q}
+        trap - EXIT
+        """
+
+
+# Module 03 exporter expects fixed input names (genic.selected.tsv and
+# intergenic.selected.tsv). Stage symlinks with those names, run the unchanged
+# exporter, then rename its three outputs with the active threshold tag.
+rule export_final_edit_sites:
+    input:
+        genic=os.path.join(OUT_DIR, "{sp}", f"genic.{THRESHOLD_TAG}.selected.tsv"),
+        intergenic=os.path.join(OUT_DIR, "{sp}", f"intergenic.{THRESHOLD_TAG}.selected.tsv"),
+        samples=SAMPLES_TSV,
+        script=EXPORT_SCRIPT
+    output:
+        genic=os.path.join(FINAL_OUT_DIR, "{sp}", f"genic.final_sites.{THRESHOLD_TAG}.tsv"),
+        intergenic=os.path.join(FINAL_OUT_DIR, "{sp}", f"intergenic.final_sites.{THRESHOLD_TAG}.tsv"),
+        all=os.path.join(FINAL_OUT_DIR, "{sp}", f"all.final_sites.{THRESHOLD_TAG}.tsv")
+    params:
+        python=PYTHON,
+        tag=THRESHOLD_TAG
+    log:
+        os.path.join(OUT_DIR, "{sp}", "logs", "03_export_final_sites." + THRESHOLD_TAG + ".log")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname {log:q})" "$(dirname {output.genic:q})"
+        stage_root="$(mktemp -d "$(dirname {output.genic:q})/.stage_{wildcards.sp}_{params.tag}.XXXXXX")"
+        trap 'rm -rf "$stage_root"' EXIT
+
+        mkdir -p "$stage_root/input/{wildcards.sp}" "$stage_root/output"
+        ln -s "$(realpath {input.genic:q})" "$stage_root/input/{wildcards.sp}/genic.selected.tsv"
+        ln -s "$(realpath {input.intergenic:q})" "$stage_root/input/{wildcards.sp}/intergenic.selected.tsv"
+
+        {params.python:q} {input.script:q} \
+            --input-root "$stage_root/input" \
+            --samples {input.samples:q} \
+            --output-root "$stage_root/output" \
+            --species {wildcards.sp:q} > {log:q} 2>&1
+
+        test -s "$stage_root/output/{wildcards.sp}/genic.final_sites.tsv"
+        test -s "$stage_root/output/{wildcards.sp}/intergenic.final_sites.tsv"
+        test -s "$stage_root/output/{wildcards.sp}/all.final_sites.tsv"
+
+        mv -f "$stage_root/output/{wildcards.sp}/genic.final_sites.tsv" {output.genic:q}
+        mv -f "$stage_root/output/{wildcards.sp}/intergenic.final_sites.tsv" {output.intergenic:q}
+        mv -f "$stage_root/output/{wildcards.sp}/all.final_sites.tsv" {output.all:q}
+
+        trap - EXIT
+        rm -rf "$stage_root"
+        """
+
+
+# The denominator is the sum of all 12 mutation classes in supported.tsv,
+# exactly matching the mutation_types.pdf. Numerators are checked against
+# selected.tsv: genic A>G; intergenic A>G + T>C.
+rule summarize_variant_type_proportions:
+    input:
+        genic_supported=os.path.join(OUT_DIR, "{sp}", f"genic.{THRESHOLD_TAG}.supported.tsv"),
+        intergenic_supported=os.path.join(OUT_DIR, "{sp}", f"intergenic.{THRESHOLD_TAG}.supported.tsv"),
+        genic_selected=os.path.join(OUT_DIR, "{sp}", f"genic.{THRESHOLD_TAG}.selected.tsv"),
+        intergenic_selected=os.path.join(OUT_DIR, "{sp}", f"intergenic.{THRESHOLD_TAG}.selected.tsv")
+    output:
+        summary=os.path.join(FINAL_OUT_DIR, "{sp}", f"variant_type_proportion.{THRESHOLD_TAG}.tsv")
+    run:
+        os.makedirs(os.path.dirname(output.summary), exist_ok=True)
+
+        def count_mutations(path):
+            counts = Counter({mutation: 0 for mutation in MUTATION_TYPES})
+            unclassified = 0
+
+            with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                if not reader.fieldnames or "mut" not in reader.fieldnames:
+                    raise ValueError(f"Missing 'mut' column in mutation table: {path}")
+                for row in reader:
+                    mutation = (row.get("mut") or "").strip().upper()
+                    if mutation in counts:
+                        counts[mutation] += 1
+                    else:
+                        unclassified += 1
+
+            return counts, unclassified
+
+        def count_selected(path, allowed_mutations):
+            n = 0
+            with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                if not reader.fieldnames or "mut" not in reader.fieldnames:
+                    raise ValueError(f"Missing 'mut' column in selected-site table: {path}")
+                for row in reader:
+                    mutation = (row.get("mut") or "").strip().upper()
+                    if mutation not in allowed_mutations:
+                        raise ValueError(
+                            f"Unexpected mutation {mutation!r} in {path}; "
+                            f"expected one of {sorted(allowed_mutations)}"
+                        )
+                    n += 1
+            return n
+
+        genic_counts, genic_unclassified = count_mutations(input.genic_supported)
+        intergenic_counts, intergenic_unclassified = count_mutations(input.intergenic_supported)
+
+        genic_target_n = count_selected(input.genic_selected, {"A>G"})
+        intergenic_target_n = count_selected(input.intergenic_selected, {"A>G", "T>C"})
+
+        rows = []
+        for region, counts, unclassified, targets, target_n in (
+            ("genic", genic_counts, genic_unclassified, ("A>G",), genic_target_n),
+            ("intergenic", intergenic_counts, intergenic_unclassified, ("A>G", "T>C"), intergenic_target_n),
+        ):
+            total = sum(counts[mutation] for mutation in MUTATION_TYPES)
+            supported_target_n = sum(counts[mutation] for mutation in targets)
+
+            if target_n != supported_target_n:
+                raise ValueError(
+                    f"Selected/support count mismatch for {wildcards.sp} {region}: "
+                    f"selected={target_n}, supported target classes={supported_target_n}"
+                )
+
+            percentage = target_n / total * 100.0 if total else None
+            row = {
+                "species": wildcards.sp,
+                "region": region,
+                "target_mutation_types": ";".join(targets),
+                "target_site_count": target_n,
+                "all_12_mutation_type_sites": total,
+                "proportion_percent": f"{percentage:.4f}" if percentage is not None else "NA",
+                "unclassified_rows_excluded_from_plot_denominator": unclassified,
+            }
+            for mutation in MUTATION_TYPES:
+                row[mutation] = counts[mutation]
+            rows.append(row)
+
+        columns = [
+            "species", "region", "target_mutation_types", "target_site_count",
+            "all_12_mutation_type_sites", "proportion_percent",
+            "unclassified_rows_excluded_from_plot_denominator",
+        ] + MUTATION_TYPES
+
+        temp_path = output.summary + f".tmp.{os.getpid()}"
+        try:
+            with open(temp_path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=columns, delimiter="\t", lineterminator="\n"
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            os.replace(temp_path, output.summary)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)

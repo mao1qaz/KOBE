@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+SIF="${RNA_EDITING_SIF:-}"
+SAMPLE_TABLE=""
+OUT_DIR=""
+GTF_DIR=""
+SITE_DIR=""
+RESUME_MODE=0
+REUSE_BAM_MODE=0
+PATH_LIST=""
+RUN_PID=""
+RUN_USE_SETSID=0
+LOCK_FILE=""
+WORKFLOW_ARGS=()
+USER_BINDS=()
+BIND_ARGS=()
+BIND_SEEN="|"
+
+usage() {
+    bash "$SCRIPT_DIR/run_workflow.sh" --help
+}
+
+absolute_path() {
+    python3 - "$1" <<'PY'
+import os
+import sys
+print(os.path.abspath(os.path.expanduser(sys.argv[1])))
+PY
+}
+
+add_bind_for_path() {
+    local path="$1" lexical resolved candidate source key
+    [[ -n "$path" ]] || return 0
+    lexical="$(absolute_path "$path")"
+    resolved="$(readlink -f -- "$lexical" 2>/dev/null || true)"
+    for candidate in "$lexical" "$resolved"; do
+        [[ -n "$candidate" && "$candidate" == /* ]] || continue
+        source=""
+        # Preserve the user-visible symlink path as well as its real target.
+        if [[ "$candidate" == "$lexical" && -n "$resolved" && "$resolved" != "$lexical" ]]; then
+            if [[ -d "$lexical" && ! -L "$lexical" ]]; then source="$lexical"; else source="$(dirname "$lexical")"; fi
+        else
+            if command -v findmnt >/dev/null 2>&1 && [[ -e "$candidate" ]]; then
+                source="$(findmnt -T "$candidate" -n -o TARGET 2>/dev/null | head -n 1 || true)"
+            fi
+            if [[ -z "$source" || "$source" == "/" ]]; then
+                if [[ -d "$candidate" ]]; then source="$candidate"; else source="$(dirname "$candidate")"; fi
+            fi
+        fi
+        [[ "$source" != "/" && -d "$source" ]] || continue
+        key="$source:$source"
+        if [[ "$BIND_SEEN" != *"|$key|"* ]]; then
+            BIND_ARGS+=(--bind "$source:$source")
+            BIND_SEEN+="$key|"
+        fi
+    done
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+command -v apptainer >/dev/null 2>&1 || { echo "ERROR: apptainer not found on the host." >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: host python3 is required." >&2; exit 1; }
+command -v flock >/dev/null 2>&1 || { echo "ERROR: flock is required for the output-directory lock." >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sif)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: --sif requires a file." >&2; exit 1; }
+            SIF="$2"; shift 2 ;;
+        --bind|-B)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: $1 requires a bind specification." >&2; exit 1; }
+            USER_BINDS+=("$2"); shift 2 ;;
+        --bind=*) USER_BINDS+=("${1#*=}"); shift ;;
+        --sample-table|--out-dir|--gtf-dir|--site-dir)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "ERROR: $1 requires a path." >&2; exit 1; }
+            key="$1"; value="$2"
+            case "$key" in
+                --sample-table) SAMPLE_TABLE="$value" ;;
+                --out-dir) OUT_DIR="$value" ;;
+                --gtf-dir) GTF_DIR="$value" ;;
+                --site-dir) SITE_DIR="$value" ;;
+            esac
+            WORKFLOW_ARGS+=("$key" "$value")
+            shift 2 ;;
+        --resume) RESUME_MODE=1; WORKFLOW_ARGS+=("$1"); shift ;;
+        --force_reditool|--force-reditool) RESUME_MODE=1; REUSE_BAM_MODE=1; WORKFLOW_ARGS+=("$1"); shift ;;
+        --reuse_bam|--reuse-bam|--bam-dir)
+            echo "ERROR: $1 has been removed. Use --force_reditool to validate/reuse in-workdir BAMs." >&2
+            exit 1 ;;
+        *) WORKFLOW_ARGS+=("$1"); shift ;;
+    esac
+done
+
+if [[ -z "$SIF" || ! -s "$SIF" ]]; then
+    echo "ERROR: Provide --sif FILE or set RNA_EDITING_SIF to the RNA editing SIF." >&2
+    exit 1
+fi
+if [[ -z "$SAMPLE_TABLE" || -z "$OUT_DIR" || -z "$GTF_DIR" || -z "$SITE_DIR" ]]; then
+    echo "ERROR: --sample-table, --out-dir, --gtf-dir and --site-dir are required." >&2
+    usage >&2
+    exit 1
+fi
+
+SIF="$(readlink -f -- "$(absolute_path "$SIF")")"
+SAMPLE_TABLE="$(absolute_path "$SAMPLE_TABLE")"
+OUT_DIR="$(absolute_path "$OUT_DIR")"
+GTF_DIR="$(absolute_path "$GTF_DIR")"
+SITE_DIR="$(absolute_path "$SITE_DIR")"
+
+[[ -s "$SAMPLE_TABLE" ]] || { echo "ERROR: Sample table not found or empty: $SAMPLE_TABLE" >&2; exit 1; }
+[[ -d "$GTF_DIR" ]] || { echo "ERROR: GTF directory not found: $GTF_DIR" >&2; exit 1; }
+[[ -d "$SITE_DIR" ]] || { echo "ERROR: Known-site directory not found: $SITE_DIR" >&2; exit 1; }
+
+# Create and canonicalize the output directory on the HOST before logging/binding.
+mkdir -p -- "$OUT_DIR"
+OUT_DIR="$(cd -- "$OUT_DIR" && pwd -P)"
+
+# Acquire a host-side lock for the entire Apptainer/Snakemake run.
+LOCK_FILE="$OUT_DIR/.base_extract.lock"
+exec 9<>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "ERROR: Another base_extract run is already using this output directory." >&2
+    echo "Output directory: $OUT_DIR" >&2
+    echo "Lock file: $LOCK_FILE" >&2
+    [[ -s "$LOCK_FILE" ]] && cat "$LOCK_FILE" >&2 || true
+    exit 1
+fi
+: > "$LOCK_FILE"
+printf 'pid=%s\nhost=%s\nstarted=%s\noutput_dir=%s\n' \
+    "$$" "$(hostname)" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$OUT_DIR" >&9
+
+cleanup_launcher() {
+    local status=$?
+    trap - EXIT INT TERM HUP
+    if [[ -n "${RUN_PID:-}" ]] && kill -0 "$RUN_PID" 2>/dev/null; then
+        if (( RUN_USE_SETSID == 1 )); then
+            kill -TERM -- "-$RUN_PID" 2>/dev/null || true
+        else
+            kill -TERM "$RUN_PID" 2>/dev/null || true
+        fi
+        wait "$RUN_PID" 2>/dev/null || true
+    fi
+    [[ -n "${PATH_LIST:-}" ]] && rm -f "$PATH_LIST"
+    [[ -n "${LOCK_FILE:-}" ]] && rm -f "$LOCK_FILE"
+    exit "$status"
+}
+trap cleanup_launcher EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Replace path arguments with normalized absolute paths.
+ARGS_ABS=()
+for ((i=0; i<${#WORKFLOW_ARGS[@]}; i++)); do
+    case "${WORKFLOW_ARGS[$i]}" in
+        --sample-table) ARGS_ABS+=(--sample-table "$SAMPLE_TABLE"); ((i+=1)) ;;
+        --out-dir) ARGS_ABS+=(--out-dir "$OUT_DIR"); ((i+=1)) ;;
+        --gtf-dir) ARGS_ABS+=(--gtf-dir "$GTF_DIR"); ((i+=1)) ;;
+        --site-dir) ARGS_ABS+=(--site-dir "$SITE_DIR"); ((i+=1)) ;;
+        *) ARGS_ABS+=("${WORKFLOW_ARGS[$i]}") ;;
+    esac
+done
+WORKFLOW_ARGS=("${ARGS_ABS[@]}")
+
+# Bind roots for the module, explicit inputs and output directory.
+add_bind_for_path "$SCRIPT_DIR"
+add_bind_for_path "$SAMPLE_TABLE"
+add_bind_for_path "$OUT_DIR"
+add_bind_for_path "$GTF_DIR"
+add_bind_for_path "$SITE_DIR"
+
+# Collect sample FASTQ/genome paths and species-matched GTF/site files on the host.
+PATH_LIST="$(mktemp)"
+
+if ! python3 - "$SAMPLE_TABLE" "$GTF_DIR" "$SITE_DIR" "$RESUME_MODE" "$REUSE_BAM_MODE" > "$PATH_LIST" <<'PY'
+import csv
+import os
+import re
+import sys
+from pathlib import Path
+
+sample_table = Path(sys.argv[1]).resolve()
+gtf_dir = Path(sys.argv[2]).resolve()
+site_dir = Path(sys.argv[3]).resolve()
+resume = sys.argv[4] == "1"
+reuse_bam = sys.argv[5] == "1"
+with sample_table.open("r", encoding="utf-8-sig", newline="") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+    if not reader.fieldnames:
+        raise SystemExit("ERROR: sample table has no header")
+    reader.fieldnames = [x.strip().lstrip("\ufeff") for x in reader.fieldnames]
+    required = {"sample_id", "species", "fq1", "fq2"}
+    missing = required - set(reader.fieldnames)
+    genome_col = next((x for x in ("genome_fasta", "genome", "reference_fasta", "ref") if x in reader.fieldnames), None)
+    if missing or genome_col is None:
+        raise SystemExit("ERROR: sample table requires sample_id, species, fq1, fq2 and genome_fasta (or genome/ref)")
+    species_seen = set()
+    sample_seen = set()
+    for line_no, row in enumerate(reader, 2):
+        sid = (row.get("sample_id") or "").strip()
+        species = (row.get("species") or "").strip()
+        if not sid or not species or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", sid) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", species):
+            raise SystemExit("ERROR: invalid sample_id/species at sample-table line %d" % line_no)
+        if (species, sid) in sample_seen:
+            raise SystemExit("ERROR: duplicate sample at sample-table line %d: %s/%s" % (line_no, species, sid))
+        sample_seen.add((species, sid))
+        paths = []
+        for col in ("fq1", "fq2", genome_col):
+            value = (row.get(col) or "").strip().strip('"').strip("'")
+            if not value:
+                if col in ("fq1", "fq2") and (resume or reuse_bam):
+                    continue
+                raise SystemExit("ERROR: empty %s at sample-table line %d" % (col, line_no))
+            p = Path(value).expanduser()
+            if not p.is_absolute(): p = sample_table.parent / p
+            p = p.resolve(strict=False)
+            if col == genome_col and not p.is_file():
+                raise SystemExit("ERROR: genome FASTA not found at line %d: %s" % (line_no, p))
+            if col in ("fq1", "fq2") and not p.is_file() and not (resume or reuse_bam):
+                raise SystemExit("ERROR: FASTQ not found at line %d: %s" % (line_no, p))
+            paths.append(str(p))
+        for p in paths:
+            sys.stdout.buffer.write(os.fsencode(p) + b"\0")
+        if species not in species_seen:
+            species_seen.add(species)
+            for p in (gtf_dir / (species + ".gtf"), site_dir / (species + "_known_sites.tsv")):
+                if not p.is_file():
+                    raise SystemExit("ERROR: species-matched input not found: %s" % p)
+                sys.stdout.buffer.write(os.fsencode(str(p.resolve())) + b"\0")
+if not sample_seen:
+    raise SystemExit("ERROR: no samples found in sample table")
+PY
+then
+    exit 1
+fi
+
+while IFS= read -r -d '' input_path; do add_bind_for_path "$input_path"; done < "$PATH_LIST"
+
+# Bind symlink targets found inside GTF/site directories.
+for input_dir in "$GTF_DIR" "$SITE_DIR"; do
+    while IFS= read -r -d '' entry; do add_bind_for_path "$entry"; done \
+        < <(find -L "$input_dir" -maxdepth 1 -type f -print0 2>/dev/null || true)
+done
+
+for spec in "${USER_BINDS[@]}"; do
+    [[ -n "$spec" ]] || continue
+    source_path="${spec%%:*}"
+    add_bind_for_path "$source_path"
+    if [[ "$spec" != *:* ]]; then
+        key="$source_path:$source_path"
+        [[ "$BIND_SEEN" == *"|$key|"* ]] && continue
+    elif [[ "${spec#*:}" == "$source_path" ]]; then
+        key="$source_path:$source_path"
+        [[ "$BIND_SEEN" == *"|$key|"* ]] && continue
+    fi
+    BIND_ARGS+=(--bind "$spec")
+done
+
+LOG_FILE="$OUT_DIR/base_extract.log"
+{
+    echo "[base_extract] SIF: $SIF"
+    echo "[base_extract] Output directory: $OUT_DIR"
+    echo "[base_extract] Lock acquired: $LOCK_FILE"
+    echo "[base_extract] Automatic/user bind entries: ${#BIND_ARGS[@]}"
+} | tee -a "$LOG_FILE"
+
+if command -v setsid >/dev/null 2>&1; then
+    RUN_USE_SETSID=1
+    setsid apptainer exec "${BIND_ARGS[@]}" "$SIF" bash "$SCRIPT_DIR/run_workflow.sh" "${WORKFLOW_ARGS[@]}" > >(tee -a "$LOG_FILE") 2>&1 &
+else
+    apptainer exec "${BIND_ARGS[@]}" "$SIF" bash "$SCRIPT_DIR/run_workflow.sh" "${WORKFLOW_ARGS[@]}" > >(tee -a "$LOG_FILE") 2>&1 &
+fi
+RUN_PID=$!
+set +e
+wait "$RUN_PID"
+RUN_STATUS=$?
+set -e
+RUN_PID=""
+exit "$RUN_STATUS"

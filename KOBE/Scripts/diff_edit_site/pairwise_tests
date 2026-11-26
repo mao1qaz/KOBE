@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ============================================================
+# RNA editing pairwise differential analysis launcher
+# ============================================================
+
+SIF="${RNA_EDITING_SIF:-}"
+INPUT=""
+OUTDIR=""
+COMPARISONS=""
+MIN_COVERAGE=3
+MIN_COVERAGE_SET=0
+FDR_CUTOFF=0.05
+FDR_CUTOFF_SET=0
+FORCE=0
+FORCE_SET=0
+
+declare -a GROUP_ARGS=()
+declare -a BIND_SPECS=()
+declare -a BIND_HOSTS=()
+declare -a BIND_DESTS=()
+declare -a APPTAINER_ARGS=()
+declare -a R_ARGS=()
+declare -a RESULT_NAMES=()
+
+declare -A GROUP_SEEN=()
+declare -A COMPARISON_SEEN=()
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'HELP'
+Usage:
+  pairwise_tests --input FILE --group NAME=SAMPLES [--group NAME=SAMPLES ...] \
+    --comparisons A:B[,C:D,...] --outdir DIR [--sif FILE] \
+    [--bind DIR ...] [--min_coverage INT] [--fdr_cutoff FLOAT] [--force]
+
+Required:
+  --input FILE
+  --group STRING (NAME=SAMPLE1,SAMPLE2,...)
+  --comparisons STRING (A:B[,C:D,...])
+  --outdir DIR
+  --sif FILE (or set RNA_EDITING_SIF)
+
+Optional:
+  --bind DIR ...
+  --min_coverage INT   Minimum A+G coverage (default: 3)
+  --fdr_cutoff FLOAT   BH-FDR significance cutoff (default: 0.05)
+  --force             Replace existing requested comparison directories
+  -h, --help          Show this help
+
+Example:
+  pairwise_tests \
+      --input /path/to/project/editing_counts.tsv \
+      --group N=N1,N2,N3 \
+      --group F=F1,F2,F3 \
+      --group C=C1,C2,C3 \
+      --comparisons N:F,N:C,F:C \
+      --min_coverage 3 \
+      --fdr_cutoff 0.05 \
+      --outdir /path/to/project/diff_result \
+      --sif /path/to/rna_editing.sif \
+      --bind /path/to/project
+
+Results:
+  OUTDIR/N_vs_F/                         N vs F comparison results
+  OUTDIR/N_vs_C/                         N vs C comparison results
+  OUTDIR/F_vs_C/                         F vs C comparison results
+  OUTDIR/run_N_vs_F__N_vs_C__F_vs_C_pairwise_tests.log
+HELP
+}
+
+require_value() {
+    local option="$1"
+    local value="${2:-}"
+    [[ -n "$value" && "$value" != --* ]] ||
+        die "$option requires a value."
+}
+
+# ------------------------------------------------------------
+# 1. Parse arguments
+# ------------------------------------------------------------
+
+while (($#)); do
+    case "$1" in
+        --input)
+            require_value "$1" "${2:-}"
+            [[ -z "$INPUT" ]] || die "Specify --input only once."
+            INPUT="$2"
+            shift 2
+            ;;
+
+        --group)
+            require_value "$1" "${2:-}"
+            GROUP_ARGS+=("$2")
+            shift 2
+            ;;
+
+        --comparisons)
+            require_value "$1" "${2:-}"
+            [[ -z "$COMPARISONS" ]] || die "Specify --comparisons only once."
+            COMPARISONS="$2"
+            shift 2
+            ;;
+
+        --min_coverage)
+            require_value "$1" "${2:-}"
+            [[ "$MIN_COVERAGE_SET" -eq 0 ]] ||
+                die "Specify --min_coverage only once."
+            MIN_COVERAGE="$2"
+            [[ "$MIN_COVERAGE" =~ ^[1-9][0-9]*$ ]] ||
+                die "--min_coverage must be a positive integer."
+            MIN_COVERAGE_SET=1
+            shift 2
+            ;;
+
+        --fdr_cutoff)
+            require_value "$1" "${2:-}"
+            [[ "$FDR_CUTOFF_SET" -eq 0 ]] ||
+                die "Specify --fdr_cutoff only once."
+            FDR_CUTOFF="$2"
+            [[ "$FDR_CUTOFF" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]] ||
+                die "--fdr_cutoff must be a numeric value between 0 and 1."
+            awk -v x="$FDR_CUTOFF" 'BEGIN { if (x <= 0 || x > 1) exit 1 }' ||
+                die "--fdr_cutoff must be greater than 0 and less than or equal to 1."
+            FDR_CUTOFF_SET=1
+            shift 2
+            ;;
+
+        --outdir)
+            require_value "$1" "${2:-}"
+            [[ -z "$OUTDIR" ]] || die "Specify --outdir only once."
+            OUTDIR="$2"
+            shift 2
+            ;;
+
+        --sif)
+            require_value "$1" "${2:-}"
+            [[ -z "$SIF" ]] || die "Specify --sif only once."
+            SIF="$2"
+            shift 2
+            ;;
+
+        --bind)
+            require_value "$1" "${2:-}"
+            BIND_SPECS+=("$2")
+            shift 2
+            ;;
+
+        --force)
+            [[ "$FORCE_SET" -eq 0 ]] || die "Specify --force only once."
+            FORCE=1
+            FORCE_SET=1
+            shift
+            ;;
+
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------
+# 2. Validate required arguments and host paths
+# ------------------------------------------------------------
+
+[[ -n "$INPUT" ]] || die "Missing --input."
+[[ -n "$COMPARISONS" ]] || die "Missing --comparisons."
+[[ -n "$OUTDIR" ]] || die "Missing --outdir."
+[[ -n "$SIF" ]] || die "Missing --sif."
+
+((${#GROUP_ARGS[@]} >= 2)) ||
+    die "At least two --group arguments are required."
+
+[[ "$INPUT" == /* ]] || die "Please provide an absolute --input path."
+[[ "$OUTDIR" == /* ]] || die "Please provide an absolute --outdir path."
+
+[[ -f "$INPUT" && -r "$INPUT" ]] ||
+    die "Input file not found or unreadable: $INPUT"
+
+[[ -s "$SIF" ]] || die "SIF file not found: $SIF"
+
+command -v apptainer >/dev/null 2>&1 ||
+    die "Apptainer is not available."
+
+INPUT=$(realpath -- "$INPUT")
+SIF=$(realpath -- "$SIF")
+
+# Automatically bind the input file, output directory, and this module's R
+# scripts at their original absolute paths. Explicit --bind mappings remain
+# available for additional user data locations or custom container paths.
+mkdir -p -- "$OUTDIR"
+OUTDIR=$(cd -- "$OUTDIR" && pwd -P)
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd -P)
+
+path_is_covered_by_user_bind() {
+    local path="$1" spec host
+    for spec in "${BIND_SPECS[@]}"; do
+        host="${spec%%:*}"
+        [[ "$path" == "$host" || "$path" == "$host/"* ]] && return 0
+    done
+    return 1
+}
+
+for auto_path in "$(dirname -- "$INPUT")" "$OUTDIR" "$SCRIPT_DIR"; do
+    if ! path_is_covered_by_user_bind "$auto_path"; then
+        BIND_SPECS+=("$auto_path:$auto_path")
+    fi
+done
+
+# ------------------------------------------------------------
+# 3. Validate group definitions
+# ------------------------------------------------------------
+
+for group_spec in "${GROUP_ARGS[@]}"; do
+    [[ "$group_spec" == *=* ]] ||
+        die "Invalid group format: $group_spec"
+
+    group_name="${group_spec%%=*}"
+    samples="${group_spec#*=}"
+
+    [[ "$group_name" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+        die "Invalid group name: $group_name"
+
+    [[ -n "$samples" ]] ||
+        die "Empty sample list in group: $group_name"
+
+    [[ -z "${GROUP_SEEN[$group_name]+x}" ]] ||
+        die "Duplicate group name: $group_name"
+
+    GROUP_SEEN["$group_name"]=1
+done
+
+# ------------------------------------------------------------
+# 4. Validate comparisons and determine result directories
+# ------------------------------------------------------------
+
+IFS=',' read -r -a PAIRS <<< "$COMPARISONS"
+((${#PAIRS[@]} > 0)) || die "No comparisons were specified."
+
+for pair in "${PAIRS[@]}"; do
+    pair="${pair//[[:space:]]/}"
+
+    [[ "$pair" =~ ^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)$ ]] ||
+        die "Invalid comparison format: $pair"
+
+    group1="${BASH_REMATCH[1]}"
+    group2="${BASH_REMATCH[2]}"
+
+    [[ "$group1" != "$group2" ]] ||
+        die "Cannot compare a group with itself: $pair"
+
+    [[ -n "${GROUP_SEEN[$group1]+x}" ]] ||
+        die "Undefined group in comparison: $group1"
+
+    [[ -n "${GROUP_SEEN[$group2]+x}" ]] ||
+        die "Undefined group in comparison: $group2"
+
+    result_name="${group1}_vs_${group2}"
+
+    [[ -z "${COMPARISON_SEEN[$result_name]+x}" ]] ||
+        die "Duplicate comparison: $pair"
+
+    COMPARISON_SEEN["$result_name"]=1
+    RESULT_NAMES+=("$result_name")
+done
+
+# ------------------------------------------------------------
+# 5. Locate the R scripts
+# ------------------------------------------------------------
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd -P)
+
+R_SCRIPT_HOST="$SCRIPT_DIR/run_pairwise_tests.R"
+LLR_SCRIPT_HOST="$SCRIPT_DIR/REDIT_LLR.R"
+REG_SCRIPT_HOST="$SCRIPT_DIR/REDIT_regression.R"
+
+for file in "$R_SCRIPT_HOST" "$LLR_SCRIPT_HOST" "$REG_SCRIPT_HOST"; do
+    [[ -s "$file" ]] || die "Required R script not found: $file"
+done
+
+RSCRIPT="/opt/rna_editing/envs/r42/bin/Rscript"
+
+# ------------------------------------------------------------
+# 6. Parse and validate bind mappings
+#    Supported syntax: HOST_DIR or HOST_DIR:CONTAINER_DIR
+# ------------------------------------------------------------
+
+for bind_spec in "${BIND_SPECS[@]}"; do
+    if [[ "$bind_spec" == *:* ]]; then
+        host_dir="${bind_spec%%:*}"
+        container_dir="${bind_spec#*:}"
+        [[ "$container_dir" != *:* ]] ||
+            die "Use --bind HOST_DIR:CONTAINER_DIR; extra colon fields are not supported."
+    else
+        host_dir="$bind_spec"
+        container_dir="$bind_spec"
+    fi
+
+    [[ "$host_dir" == /* ]] ||
+        die "Bind source must be an absolute path: $host_dir"
+
+    [[ "$container_dir" == /* ]] ||
+        die "Bind destination must be an absolute path: $container_dir"
+
+    [[ -d "$host_dir" ]] ||
+        die "Bind source directory not found: $host_dir"
+
+    host_dir=$(cd -- "$host_dir" && pwd -P)
+    container_dir="${container_dir%/}"
+    [[ -n "$container_dir" ]] || container_dir="/"
+
+    BIND_HOSTS+=("$host_dir")
+    BIND_DESTS+=("$container_dir")
+    APPTAINER_ARGS+=(--bind "$host_dir:$container_dir")
+done
+
+# Translate a host path to its path inside the container.
+# The most specific matching bind source takes precedence.
+map_host_path_to_container() {
+    local path="$1"
+    local host_dir
+    local best_host=""
+    local best_dest=""
+    local best_len=-1
+    local current_len
+    local suffix
+
+    for i in "${!BIND_HOSTS[@]}"; do
+        host_dir="${BIND_HOSTS[$i]}"
+
+        if [[ "$path" == "$host_dir" || "$path" == "$host_dir/"* ]]; then
+            current_len=${#host_dir}
+            if ((current_len > best_len)); then
+                best_len=$current_len
+                best_host="$host_dir"
+                best_dest="${BIND_DESTS[$i]}"
+            fi
+        fi
+    done
+
+    ((best_len >= 0)) ||
+        die "Path is not covered by any --bind mapping: $path"
+
+    suffix="${path#"$best_host"}"
+
+    if [[ "$best_dest" == "/" ]]; then
+        printf '/%s\n' "${suffix#/}"
+    else
+        printf '%s%s\n' "${best_dest%/}" "$suffix"
+    fi
+}
+
+# ------------------------------------------------------------
+# 7. Prepare and map output directory
+# ------------------------------------------------------------
+
+INPUT_CONTAINER=$(map_host_path_to_container "$INPUT")
+OUTDIR_CONTAINER=$(map_host_path_to_container "$OUTDIR")
+R_SCRIPT_HOST=$(readlink -f -- "$R_SCRIPT_HOST")
+R_SCRIPT_CONTAINER=$(map_host_path_to_container "$R_SCRIPT_HOST")
+
+# ------------------------------------------------------------
+# 8. Check existing comparison result directories
+# ------------------------------------------------------------
+
+for result_name in "${RESULT_NAMES[@]}"; do
+    result_dir="$OUTDIR/$result_name"
+
+    if [[ -e "$result_dir" || -L "$result_dir" ]]; then
+        if [[ "$FORCE" -eq 0 ]]; then
+            echo >&2
+            echo "ERROR: Comparison result already exists." >&2
+            echo "Comparison: $result_name" >&2
+            echo "Directory: $result_dir" >&2
+            echo "Use --force to replace this comparison result." >&2
+            exit 1
+        fi
+    fi
+done
+
+# ------------------------------------------------------------
+# 9. Remove only requested comparison directories with --force
+# ------------------------------------------------------------
+
+if [[ "$FORCE" -eq 1 ]]; then
+    for result_name in "${RESULT_NAMES[@]}"; do
+        result_dir="$OUTDIR/$result_name"
+        if [[ -e "$result_dir" || -L "$result_dir" ]]; then
+            echo "Removing existing result: $result_dir"
+            rm -rf -- "$result_dir"
+        fi
+    done
+fi
+
+# ------------------------------------------------------------
+# 10. Build R arguments
+# ------------------------------------------------------------
+
+R_ARGS=(--input "$INPUT_CONTAINER")
+
+for group_spec in "${GROUP_ARGS[@]}"; do
+    R_ARGS+=(--group "$group_spec")
+done
+
+R_ARGS+=(
+    --comparisons "$COMPARISONS"
+    --min_coverage "$MIN_COVERAGE"
+    --fdr_cutoff "$FDR_CUTOFF"
+    --outdir "$OUTDIR_CONTAINER"
+)
+
+# ------------------------------------------------------------
+# 11. Log directly in the output directory
+# ------------------------------------------------------------
+
+LOG_COMPARISONS=$(printf '%s__' "${RESULT_NAMES[@]}")
+LOG_COMPARISONS=${LOG_COMPARISONS%__}
+LOG_FILE="$OUTDIR/run_${LOG_COMPARISONS}_pairwise_tests.log"
+
+echo "============================================================"
+echo "RNA EDITING PAIRWISE DIFFERENTIAL ANALYSIS"
+echo "============================================================"
+echo "Input: $INPUT"
+echo "Output: $OUTDIR"
+echo "Comparisons: $COMPARISONS"
+echo "Minimum coverage: $MIN_COVERAGE"
+echo "BH-FDR cutoff: $FDR_CUTOFF"
+echo "SIF: $SIF"
+echo "Log: $LOG_FILE"
+echo "============================================================"
+
+# ------------------------------------------------------------
+# 12. Execute R analysis inside Apptainer
+# ------------------------------------------------------------
+
+if apptainer exec \
+    "${APPTAINER_ARGS[@]}" \
+    "$SIF" \
+    "$RSCRIPT" \
+    "$R_SCRIPT_CONTAINER" \
+    "${R_ARGS[@]}" \
+    2>&1 | tee "$LOG_FILE"; then
+
+    echo
+    echo "============================================================"
+    echo "PAIRWISE ANALYSIS COMPLETED"
+    echo "============================================================"
+    echo "Results: $OUTDIR"
+    echo "Log: $LOG_FILE"
+
+else
+    status=$?
+    echo >&2
+    echo "ERROR: Pairwise analysis failed."
+    echo "Exit code: $status"
+    echo "Log: $LOG_FILE"
+    exit "$status"
+fi

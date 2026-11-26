@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/container_runner.sh"
+run_add_tool "$SCRIPT_DIR/extract_cds_candidate_sites.py" "$@"

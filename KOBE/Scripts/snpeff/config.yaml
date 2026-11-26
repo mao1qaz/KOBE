@@ -1,0 +1,37 @@
+
+# =====================================================
+# SnpEff configuration
+# =====================================================
+
+# Input files: supplied by all_step.sh
+gtf: ""
+fasta: ""
+result_dir: ""
+species: ""
+
+# =====================================================
+# Container software
+# =====================================================
+
+jar: "/opt/rna_editing/jars/snpEff.jar"
+
+base_config: "/opt/rna_editing/config/snpEff.config"
+
+java: "/opt/rna_editing/bin/java25"
+
+# =====================================================
+# Resources
+# =====================================================
+
+heap: "8g"
+
+memory_mb: 12000
+
+# =====================================================
+# Build arguments
+# =====================================================
+
+build_args:
+  - "-gtf22"
+  - "-noCheckCds"
+  - "-noCheckProtein"

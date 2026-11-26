@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+BIN_DIR="$(cd -- "$(dirname -- "$SELF")" && pwd -P)"
+PKG_ROOT="$(cd -- "$BIN_DIR/.." && pwd -P)"
+INVOKED_AS="$(basename -- "$0")"
+
+usage() {
+    cat <<'EOF'
+KOBE: Kit for orthology-based editing analysis – 8 modules in 1
+
+Usage:
+  KOBE COMMAND [arguments ...]
+  COMMAND [arguments ...]   (after install.sh registers command aliases)
+
+Commands:
+  snpeff_build
+  denovo_detect_map
+  denovo_detect_anno
+  base_extract
+  pairwise_tests
+  ortho_edit
+  conserve_plot
+  find_back
+  add_new_site
+  find_back_plot
+
+Additional utilities:
+  add_cds_sites_genomic_coordinates
+  extract_cds_candidate_sites
+  extract_longest_cds
+  genome_site_cds_position
+  prepare_snpeff_gtf
+  supported_sites_to_editing_counts
+
+Use COMMAND --help for command-specific options.
+EOF
+}
+
+if [[ "$INVOKED_AS" == "KOBE" ]]; then
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then usage; exit 0; fi
+    if [[ "${1:-}" == "--version" ]]; then echo "KOBE 1.0.0"; exit 0; fi
+    if [[ "${1:-}" == "--list" ]]; then usage; exit 0; fi
+    COMMAND="$1"
+    shift
+else
+    COMMAND="$INVOKED_AS"
+fi
+
+case "$COMMAND" in
+    base_extract) TARGET="$PKG_ROOT/Scripts/base_extract/base_extract" ;;
+    find_back) TARGET="$PKG_ROOT/Scripts/find_back/find_back" ;;
+    denovo_detect_map) TARGET="$PKG_ROOT/Scripts/denovo_detect/denovo_detect_map" ;;
+    denovo_detect_anno) TARGET="$PKG_ROOT/Scripts/denovo_detect/denovo_detect_anno" ;;
+    ortho_edit) TARGET="$PKG_ROOT/Scripts/ortho_edit/ortho_edit" ;;
+    conserve_plot) TARGET="$PKG_ROOT/Scripts/conserve_plot/conserve_plot" ;;
+    find_back_plot) TARGET="$PKG_ROOT/Scripts/conserve_plot/find_back_plot" ;;
+    add_new_site) TARGET="$PKG_ROOT/Scripts/conserve_plot/add_new_site" ;;
+    pairwise_tests) TARGET="$PKG_ROOT/Scripts/diff_edit_site/pairwise_tests" ;;
+    snpeff_build) TARGET="$PKG_ROOT/Scripts/snpeff/snpeff_build" ;;
+    add_cds_sites_genomic_coordinates) TARGET="$PKG_ROOT/Scripts/add/add_cds_sites_genomic_coordinates" ;;
+    extract_cds_candidate_sites) TARGET="$PKG_ROOT/Scripts/add/extract_cds_candidate_sites" ;;
+    extract_longest_cds) TARGET="$PKG_ROOT/Scripts/add/extract_longest_cds" ;;
+    genome_site_cds_position) TARGET="$PKG_ROOT/Scripts/add/genome_site_cds_position" ;;
+    prepare_snpeff_gtf) TARGET="$PKG_ROOT/Scripts/add/prepare_snpeff_gtf" ;;
+    supported_sites_to_editing_counts) TARGET="$PKG_ROOT/Scripts/add/supported_sites_to_editing_counts" ;;
+    *)
+        echo "ERROR: Unknown KOBE command: $COMMAND" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+if [[ ! -x "$TARGET" ]]; then
+    echo "ERROR: Command is missing or not executable: $TARGET" >&2
+    exit 127
+fi
+exec "$TARGET" "$@"

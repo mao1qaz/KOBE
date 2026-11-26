@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/container_runner.sh"
+
+SIF="${RNA_EDITING_SIF:-}"
+SAMPLES=""
+REF_DIR=""
+OUT_DIR=""
+CORES=""
+
+FASTP_THREADS=10
+BWA_THREADS=15
+STAR_THREADS=15
+SAMTOOLS_SORT_THREADS=10
+SAMBAMBA_THREADS=20
+FASTP_N_BASE_LIMIT=5
+FASTP_QUALIFIED_QUALITY_PHRED=15
+FASTP_UNQUALIFIED_PERCENT_LIMIT=50
+FASTP_LENGTH_REQUIRED=150
+FASTP_DISABLE_LENGTH_FILTERING=false
+FASTP_AVERAGE_QUAL=0
+FASTP_DISABLE_TRIM_POLY_G=true
+FASTP_DISABLE_ADAPTER_TRIMMING=false
+FASTP_DETECT_ADAPTER_FOR_PE=false
+STAR_SJDB_OVERHANG=149
+STAR_LIMIT_GENOME_GENERATE_RAM=60000000000
+STAR_LIMIT_BAM_SORT_RAM=12884901888
+SAMBAMBA_SORT_MEMORY=6G
+SAMBAMBA_OVERFLOW_LIST_SIZE=10000000
+MEM_FASTP_MB=4000
+MEM_REFERENCE_PREPARE_MB=6000
+MEM_BWA_INDEX_MB=8000
+MEM_STAR_INDEX_MB=64000
+MEM_BWA_MAP_MB=8000
+MEM_STAR_MAP_MB=16000
+MEM_PICARD_MB=81200
+MEM_GATK_SPLIT_MB=65000
+MEM_SAMBAMBA_SORT_MB=8000
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  denovo_detect_map --samples FILE --ref-dir DIR --out-dir DIR --cores INT \
+    [--fastp-length-required INT|none|off] [--sif FILE] [--bind DIR ...]
+
+Required:
+  --samples FILE             Sample table (sample_id, sample_name, species, type, fq1, fq2)
+  --ref-dir DIR              Contains <species>.fa and <species>.gtf
+  --out-dir DIR              Mapping work directory; created on the host if absent
+  --cores INT                Total Snakemake CPU limit
+
+Thread defaults:
+  --fastp-threads INT         (default: 10)
+  --bwa-threads INT           (default: 15)
+  --star-threads INT          (default: 15)
+  --samtools-sort-threads INT (default: 10)
+  --sambamba-threads INT      (default: 20)
+
+fastp defaults:
+  --fastp-n-base-limit INT                (default: 5)
+  --fastp-qualified-quality-phred INT     (default: 15)
+  --fastp-unqualified-percent-limit INT   (default: 50)
+  --fastp-length-required INT|none|off    (default: 150; none/off omits explicit -l)
+  --fastp-average-qual INT                (default: 0)
+  --fastp-disable-trim-poly-g             (enabled by default; use --fastp-enable-trim-poly-g to disable)
+
+Other configurable options:
+  --fastp-disable-length-filtering | --fastp-enable-length-filtering
+  --fastp-disable-adapter-trimming | --fastp-enable-adapter-trimming
+  --fastp-detect-adapter-for-pe | --fastp-no-detect-adapter-for-pe
+  --star-sjdb-overhang INT
+  --star-limit-genome-generate-ram INT
+  --star-limit-bam-sort-ram INT
+  --sambamba-sort-memory STRING           (e.g. 8G)
+  --sambamba-overflow-list-size INT
+  --mem-fastp-mb INT --mem-reference-prepare-mb INT --mem-bwa-index-mb INT
+  --mem-star-index-mb INT --mem-bwa-map-mb INT --mem-star-map-mb INT
+  --mem-picard-mb INT --mem-gatk-split-mb INT --mem-sambamba-sort-mb INT
+  --sif FILE                             Apptainer image; alternatively set RNA_EDITING_SIF
+  --bind DIR              Additional bind; may be repeated
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+require_host_tools
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --samples) SAMPLES="$2"; shift 2 ;;
+        --ref-dir) REF_DIR="$2"; shift 2 ;;
+        --out-dir) OUT_DIR="$2"; shift 2 ;;
+        --cores) CORES="$2"; shift 2 ;;
+        --sif) SIF="$2"; shift 2 ;;
+        --bind|-B) add_user_bind "$2"; shift 2 ;;
+        --fastp-threads) FASTP_THREADS="$2"; shift 2 ;;
+        --bwa-threads) BWA_THREADS="$2"; shift 2 ;;
+        --star-threads) STAR_THREADS="$2"; shift 2 ;;
+        --samtools-sort-threads) SAMTOOLS_SORT_THREADS="$2"; shift 2 ;;
+        --sambamba-threads) SAMBAMBA_THREADS="$2"; shift 2 ;;
+        --fastp-n-base-limit) FASTP_N_BASE_LIMIT="$2"; shift 2 ;;
+        --fastp-qualified-quality-phred) FASTP_QUALIFIED_QUALITY_PHRED="$2"; shift 2 ;;
+        --fastp-unqualified-percent-limit) FASTP_UNQUALIFIED_PERCENT_LIMIT="$2"; shift 2 ;;
+        --fastp-length-required)
+            if [[ $# -lt 2 || -z "${2:-}" || "$2" == --* ]]; then
+                echo "ERROR: --fastp-length-required requires INT, none, or off." >&2
+                exit 2
+            fi
+            if [[ "$2" == "none" || "$2" == "off" || "$2" == "null" ]]; then
+                FASTP_LENGTH_REQUIRED="none"
+            else
+                FASTP_LENGTH_REQUIRED="$2"
+            fi
+            shift 2 ;;
+        --fastp-average-qual) FASTP_AVERAGE_QUAL="$2"; shift 2 ;;
+        --fastp-disable-length-filtering) FASTP_DISABLE_LENGTH_FILTERING=true; shift ;;
+        --fastp-enable-length-filtering) FASTP_DISABLE_LENGTH_FILTERING=false; shift ;;
+        --fastp-disable-trim-poly-g) FASTP_DISABLE_TRIM_POLY_G=true; shift ;;
+        --fastp-enable-trim-poly-g) FASTP_DISABLE_TRIM_POLY_G=false; shift ;;
+        --fastp-disable-adapter-trimming) FASTP_DISABLE_ADAPTER_TRIMMING=true; shift ;;
+        --fastp-enable-adapter-trimming) FASTP_DISABLE_ADAPTER_TRIMMING=false; shift ;;
+        --fastp-detect-adapter-for-pe) FASTP_DETECT_ADAPTER_FOR_PE=true; shift ;;
+        --fastp-no-detect-adapter-for-pe) FASTP_DETECT_ADAPTER_FOR_PE=false; shift ;;
+        --star-sjdb-overhang) STAR_SJDB_OVERHANG="$2"; shift 2 ;;
+        --star-limit-genome-generate-ram) STAR_LIMIT_GENOME_GENERATE_RAM="$2"; shift 2 ;;
+        --star-limit-bam-sort-ram) STAR_LIMIT_BAM_SORT_RAM="$2"; shift 2 ;;
+        --sambamba-sort-memory) SAMBAMBA_SORT_MEMORY="$2"; shift 2 ;;
+        --sambamba-overflow-list-size) SAMBAMBA_OVERFLOW_LIST_SIZE="$2"; shift 2 ;;
+        --mem-fastp-mb) MEM_FASTP_MB="$2"; shift 2 ;;
+        --mem-reference-prepare-mb) MEM_REFERENCE_PREPARE_MB="$2"; shift 2 ;;
+        --mem-bwa-index-mb) MEM_BWA_INDEX_MB="$2"; shift 2 ;;
+        --mem-star-index-mb) MEM_STAR_INDEX_MB="$2"; shift 2 ;;
+        --mem-bwa-map-mb) MEM_BWA_MAP_MB="$2"; shift 2 ;;
+        --mem-star-map-mb) MEM_STAR_MAP_MB="$2"; shift 2 ;;
+        --mem-picard-mb) MEM_PICARD_MB="$2"; shift 2 ;;
+        --mem-gatk-split-mb) MEM_GATK_SPLIT_MB="$2"; shift 2 ;;
+        --mem-sambamba-sort-mb) MEM_SAMBAMBA_SORT_MB="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$SAMPLES" || -z "$REF_DIR" || -z "$OUT_DIR" || -z "$CORES" ]]; then
+    echo "ERROR: --samples, --ref-dir, --out-dir and --cores are required." >&2
+    usage >&2
+    exit 1
+fi
+if [[ -z "$SIF" || ! -s "$SIF" ]]; then
+    echo "ERROR: Provide --sif FILE or set RNA_EDITING_SIF to the RNA editing SIF." >&2
+    exit 1
+fi
+SIF="$(absolute_path "$SIF")"
+
+SAMPLES="$(absolute_path "$SAMPLES")"
+REF_DIR="$(absolute_path "$REF_DIR")"
+OUT_DIR="$(absolute_path "$OUT_DIR")"
+[[ -s "$SAMPLES" ]] || { echo "ERROR: Sample table not found: $SAMPLES" >&2; exit 1; }
+[[ -d "$REF_DIR" ]] || { echo "ERROR: Reference directory not found: $REF_DIR" >&2; exit 1; }
+[[ "$CORES" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --cores must be a positive integer." >&2; exit 1; }
+
+# Create output directory on the host before adding it as a writable bind.
+mkdir -p -- "$OUT_DIR"
+add_bind_for_path "$SCRIPT_DIR"
+add_bind_for_path "$SAMPLES"
+add_bind_for_path "$REF_DIR"
+add_bind_for_path "$OUT_DIR"
+
+PATH_LIST="$(mktemp)"
+trap 'rm -f "$PATH_LIST"' EXIT
+if ! collect_mapping_sample_paths "$SAMPLES" "$REF_DIR" > "$PATH_LIST"; then
+    exit 1
+fi
+while IFS= read -r -d '' input_path; do
+    add_bind_for_path "$input_path"
+done < "$PATH_LIST"
+
+LOG_FILE="$OUT_DIR/denovo_detect_map.log"
+: > "$LOG_FILE"
+{
+    echo "Command: denovo_detect_map"
+    echo "Samples: $SAMPLES"
+    echo "Reference directory: $REF_DIR"
+    echo "Work directory: $OUT_DIR"
+    echo "Snakemake cores: $CORES"
+    echo "fastp length required: $FASTP_LENGTH_REQUIRED"
+    echo "fastp threads: $FASTP_THREADS; BWA threads: $BWA_THREADS; STAR threads: $STAR_THREADS"
+    echo "samtools sort threads: $SAMTOOLS_SORT_THREADS; Sambamba threads: $SAMBAMBA_THREADS"
+} >> "$LOG_FILE"
+
+CONFIG_ARGS=(
+    "work_dir=$OUT_DIR"
+    "ref_dir=$REF_DIR"
+    "samples_tsv=$SAMPLES"
+    "fastp_threads=$FASTP_THREADS"
+    "bwa_threads=$BWA_THREADS"
+    "star_threads=$STAR_THREADS"
+    "samtools_sort_threads=$SAMTOOLS_SORT_THREADS"
+    "sambamba_threads=$SAMBAMBA_THREADS"
+    "fastp_n_base_limit=$FASTP_N_BASE_LIMIT"
+    "fastp_qualified_quality_phred=$FASTP_QUALIFIED_QUALITY_PHRED"
+    "fastp_unqualified_percent_limit=$FASTP_UNQUALIFIED_PERCENT_LIMIT"
+    "fastp_length_required=$FASTP_LENGTH_REQUIRED"
+    "fastp_disable_length_filtering=$FASTP_DISABLE_LENGTH_FILTERING"
+    "fastp_average_qual=$FASTP_AVERAGE_QUAL"
+    "fastp_disable_trim_poly_g=$FASTP_DISABLE_TRIM_POLY_G"
+    "fastp_disable_adapter_trimming=$FASTP_DISABLE_ADAPTER_TRIMMING"
+    "fastp_detect_adapter_for_pe=$FASTP_DETECT_ADAPTER_FOR_PE"
+    "star_sjdb_overhang=$STAR_SJDB_OVERHANG"
+    "star_limit_genome_generate_ram=$STAR_LIMIT_GENOME_GENERATE_RAM"
+    "star_limit_bam_sort_ram=$STAR_LIMIT_BAM_SORT_RAM"
+    "sambamba_sort_memory=$SAMBAMBA_SORT_MEMORY"
+    "sambamba_overflow_list_size=$SAMBAMBA_OVERFLOW_LIST_SIZE"
+    "mem_fastp_mb=$MEM_FASTP_MB"
+    "mem_reference_prepare_mb=$MEM_REFERENCE_PREPARE_MB"
+    "mem_bwa_index_mb=$MEM_BWA_INDEX_MB"
+    "mem_star_index_mb=$MEM_STAR_INDEX_MB"
+    "mem_bwa_map_mb=$MEM_BWA_MAP_MB"
+    "mem_star_map_mb=$MEM_STAR_MAP_MB"
+    "mem_picard_mb=$MEM_PICARD_MB"
+    "mem_gatk_split_mb=$MEM_GATK_SPLIT_MB"
+    "mem_sambamba_sort_mb=$MEM_SAMBAMBA_SORT_MB"
+)
+
+CMD=(snakemake -s "$SCRIPT_DIR/01_Snakefile" --cores "$CORES" --rerun-incomplete -p --config "${CONFIG_ARGS[@]}")
+run_in_container_logged "$SIF" "$LOG_FILE" "${CMD[@]}"

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_container_runner.sh"
+
+ANNOTATED=""; OUT_DIR=""; SIF="${RNA_EDITING_SIF:-}"
+SITE_ARGS=(); BIND_PATHS=("$SCRIPT_DIR")
+
+usage() {
+    cat <<'EOF'
+Usage:
+  add_new_site --annotated FILE --sites FILE [--sites FILE ...] \
+    --outdir DIR --sif FILE [--bind DIR ...]
+
+The original transcript:cds_pos matching logic is retained.
+The updated annotation CSV and add_new_site.log are written under --outdir.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --annotated) ANNOTATED="$2"; BIND_PATHS+=("$2"); shift 2 ;;
+        --sites) SITE_ARGS+=(--sites "$2"); BIND_PATHS+=("$2"); shift 2 ;;
+        --outdir) OUT_DIR="$2"; shift 2 ;;
+        --sif) SIF="$2"; shift 2 ;;
+        --bind) BIND_PATHS+=("$2"); shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$ANNOTATED" || -z "$OUT_DIR" || -z "$SIF" || ${#SITE_ARGS[@]} -eq 0 ]]; then
+    echo "ERROR: --annotated, at least one --sites, --outdir and --sif are required." >&2
+    usage >&2
+    exit 1
+fi
+
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/add_new_site.log"
+BIND_PATHS+=("$OUT_DIR")
+CMD=("/opt/rna_editing/envs/analysis_py39/bin/python" "$SCRIPT_DIR/add_new_site.py" \
+    --annotated "$ANNOTATED" "${SITE_ARGS[@]}" --outdir "$OUT_DIR")
+
+run_in_container_logged "$SIF" "$LOG_FILE" "${BIND_PATHS[@]}" -- "${CMD[@]}"

@@ -1,0 +1,603 @@
+import csv
+import os
+
+
+def as_bool(value, default=False):
+    """Parse YAML booleans and Snakemake CLI string booleans safely."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value!r}")
+
+
+def as_optional_int(value):
+    """Parse an optional integer; none/off/null means omit fastp's -l option."""
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"none", "off", "null", ""}:
+        return None
+    try:
+        parsed = int(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid fastp length-required value {value!r}; use a non-negative integer, none, or off."
+        ) from exc
+    if parsed < 0:
+        raise ValueError(
+            f"Invalid fastp length-required value {value!r}; the integer must be non-negative."
+        )
+    return parsed
+
+
+# All user-adjustable settings are supplied by the denovo_detect_map CLI.
+# Software executables and bundled helper files are provided by the container.
+WORK_DIR = os.path.abspath(config["work_dir"])
+REF_DIR = os.path.abspath(config["ref_dir"])
+SAMPLES_TSV = os.path.abspath(config["samples_tsv"])
+RNA_HOME = os.environ.get("RNA_EDITING_HOME", "/opt/rna_editing")
+
+TOOLS = {
+    "fastp": "fastp",
+    "bwa": "bwa",
+    "star": "STAR",
+    "samtools": "samtools",
+    "sambamba": "sambamba",
+    "java": "java17",
+    "picard": os.path.join(RNA_HOME, "jars", "picard-2.27.5.jar"),
+    "gatk": os.path.join(RNA_HOME, "jars", "gatk-4.3.0.0-local.jar"),
+    "perl": "perl",
+    "perl_extract": os.path.join(RNA_HOME, "helpers", "extract.bam.pl"),
+}
+
+THREADS = {
+    "fastp": int(config.get("fastp_threads", 10)),
+    "bwa": int(config.get("bwa_threads", 15)),
+    "star": int(config.get("star_threads", 15)),
+    "samtools_sort": int(config.get("samtools_sort_threads", 10)),
+    "sambamba": int(config.get("sambamba_threads", 20)),
+}
+
+MEM = {
+    "fastp": int(config.get("mem_fastp_mb", 4000)),
+    "reference_prepare": int(config.get("mem_reference_prepare_mb", 6000)),
+    "bwa_index": int(config.get("mem_bwa_index_mb", 8000)),
+    "star_index": int(config.get("mem_star_index_mb", 64000)),
+    "bwa_map": int(config.get("mem_bwa_map_mb", 8000)),
+    "star_map": int(config.get("mem_star_map_mb", 16000)),
+    "picard": int(config.get("mem_picard_mb", 81200)),
+    "gatk_split": int(config.get("mem_gatk_split_mb", 65000)),
+    "sambamba_sort": int(config.get("mem_sambamba_sort_mb", 8000)),
+}
+
+FASTP_CFG = {
+    "n_base_limit": int(config.get("fastp_n_base_limit", 5)),
+    "qualified_quality_phred": int(config.get("fastp_qualified_quality_phred", 15)),
+    "unqualified_percent_limit": int(config.get("fastp_unqualified_percent_limit", 50)),
+    "length_required": as_optional_int(config.get("fastp_length_required", 150)),
+    "disable_length_filtering": as_bool(config.get("fastp_disable_length_filtering", False)),
+    "average_qual": int(config.get("fastp_average_qual", 0)),
+    "disable_trim_poly_g": as_bool(config.get("fastp_disable_trim_poly_g", True)),
+    "disable_adapter_trimming": as_bool(config.get("fastp_disable_adapter_trimming", False)),
+    "detect_adapter_for_pe": as_bool(config.get("fastp_detect_adapter_for_pe", False)),
+}
+
+STAR_CFG = {
+    "sjdb_overhang": int(config.get("star_sjdb_overhang", 149)),
+    "limit_genome_generate_ram": int(config.get("star_limit_genome_generate_ram", 60000000000)),
+    "limit_bam_sort_ram": int(config.get("star_limit_bam_sort_ram", 12884901888)),
+}
+
+SAMBAMBA_CFG = {
+    "sort_memory": str(config.get("sambamba_sort_memory", "6G")),
+    "overflow_list_size": int(config.get("sambamba_overflow_list_size", 10000000)),
+}
+
+wildcard_constraints:
+    type="RNA|DNA"
+
+# ============================================================
+# 1. Load and validate sample manifest
+# ============================================================
+# sample_id: unique ID for each sequencing library.
+# sample_name: biological grouping label used by downstream modules.
+# sample_name may repeat; sample_id must be globally unique.
+REQUIRED_COLUMNS = ["sample_id", "sample_name", "species", "type", "fq1", "fq2"]
+SAMPLES = []
+SAMPLE_LOOKUP = {}
+SEEN_SAMPLE_IDS = set()
+
+if not os.path.isfile(SAMPLES_TSV):
+    raise FileNotFoundError(f"Sample manifest not found: {SAMPLES_TSV}")
+
+with open(SAMPLES_TSV, newline="", encoding="utf-8-sig") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+
+    if reader.fieldnames is None:
+        raise ValueError("Sample manifest is empty.")
+
+    missing = set(REQUIRED_COLUMNS) - set(reader.fieldnames)
+    if missing:
+        raise ValueError(f"Missing TSV columns: {sorted(missing)}")
+
+    for line_no, raw in enumerate(reader, start=2):
+        row = {key: (raw.get(key) or "").strip() for key in REQUIRED_COLUMNS}
+
+        if any(not row[key] for key in REQUIRED_COLUMNS):
+            raise ValueError(f"Empty required field at TSV line {line_no}")
+
+        row["type"] = row["type"].upper()
+        if row["type"] not in {"RNA", "DNA"}:
+            raise ValueError(f"Invalid type at TSV line {line_no}: {row['type']}")
+
+        for key in ["sample_id", "species"]:
+            if any(char in row[key] for char in ["/", "\\", "\n", "\t"]):
+                raise ValueError(f"Invalid {key} at TSV line {line_no}")
+
+        if any(char in row["sample_name"] for char in ["\n", "\r", "\t"]):
+            raise ValueError(f"Invalid sample_name at TSV line {line_no}")
+
+        if row["sample_id"] in SEEN_SAMPLE_IDS:
+            raise ValueError(
+                f"sample_id must be globally unique; duplicate: {row['sample_id']}"
+            )
+        SEEN_SAMPLE_IDS.add(row["sample_id"])
+
+        for key in ["fq1", "fq2"]:
+            if not os.path.isabs(row[key]):
+                row[key] = os.path.abspath(
+                    os.path.join(os.path.dirname(SAMPLES_TSV), row[key])
+                )
+            if not os.path.isfile(row[key]):
+                raise FileNotFoundError(
+                    f"FASTQ file not found at TSV line {line_no}: {row[key]}"
+                )
+
+        key = (row["species"], row["type"], row["sample_id"])
+        if key in SAMPLE_LOOKUP:
+            raise ValueError(f"Duplicate sample entry: {key}")
+
+        SAMPLE_LOOKUP[key] = row
+        SAMPLES.append(row)
+
+if not SAMPLES:
+    raise ValueError("No samples found in the TSV file.")
+
+
+def sample_row(w, type_):
+    key = (w.sp, type_, w.sample_id)
+    if key not in SAMPLE_LOOKUP:
+        raise ValueError(f"Sample not found in TSV: {key}")
+    return SAMPLE_LOOKUP[key]
+
+
+# Build configurable fastp arguments.
+FASTP_ARGS = [
+    f"-n {FASTP_CFG.get('n_base_limit', 5)}",
+    f"-q {FASTP_CFG.get('qualified_quality_phred', 15)}",
+    f"-u {FASTP_CFG.get('unqualified_percent_limit', 50)}",
+]
+
+if FASTP_CFG.get("disable_length_filtering", False):
+    FASTP_ARGS.append("-L")
+elif FASTP_CFG.get("length_required") is not None:
+    FASTP_ARGS.append(f"-l {FASTP_CFG['length_required']}")
+
+if FASTP_CFG.get("average_qual", 0) > 0:
+    FASTP_ARGS.append(f"-e {FASTP_CFG['average_qual']}")
+
+if FASTP_CFG.get("disable_trim_poly_g", False):
+    FASTP_ARGS.append("-G")
+
+if FASTP_CFG.get("disable_adapter_trimming", False):
+    FASTP_ARGS.append("-A")
+
+if FASTP_CFG.get("detect_adapter_for_pe", False):
+    FASTP_ARGS.append("--detect_adapter_for_pe")
+
+FASTP_ARGS = " ".join(FASTP_ARGS)
+
+
+# ============================================================
+# 2. Final targets
+# ============================================================
+FINAL_TARGETS = []
+
+for row in SAMPLES:
+    sp = row["species"]
+    sid = row["sample_id"]
+
+    if row["type"] == "RNA":
+        bam = f"{WORK_DIR}/01_MAP/{sp}/RNA/final/{sid}/split.bam"
+    else:
+        bam = f"{WORK_DIR}/01_MAP/{sp}/DNA/{sid}/{sid}.nodup.bam"
+
+    FINAL_TARGETS.extend([bam, bam + ".bai"])
+
+
+rule all:
+    input:
+        FINAL_TARGETS
+
+
+# ============================================================
+# 3. fastp QC for RNA and DNA
+# ============================================================
+rule fastp:
+    input:
+        r1=lambda w: sample_row(w, w.type)["fq1"],
+        r2=lambda w: sample_row(w, w.type)["fq2"]
+    output:
+        r1=f"{WORK_DIR}/00_QC/{{sp}}/{{type}}/{{sample_id}}/qc.R1.fastq.gz",
+        r2=f"{WORK_DIR}/00_QC/{{sp}}/{{type}}/{{sample_id}}/qc.R2.fastq.gz",
+        html=f"{WORK_DIR}/00_QC/{{sp}}/{{type}}/{{sample_id}}/qc.html",
+        json=f"{WORK_DIR}/00_QC/{{sp}}/{{type}}/{{sample_id}}/qc.json"
+    threads: THREADS["fastp"]
+    resources:
+        mem_mb=MEM["fastp"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.r1:q})"
+        {TOOLS[fastp]:q} {FASTP_ARGS} --thread {threads} \
+            -i {input.r1:q} -I {input.r2:q} \
+            -o {output.r1:q} -O {output.r2:q} \
+            --html {output.html:q} --json {output.json:q}
+        """
+
+
+# ============================================================
+# 4. Prepare reference FASTA, FAI and sequence dictionary
+# ============================================================
+rule reference_prepare:
+    input:
+        fa=lambda w: f"{REF_DIR}/{w.sp}.fa"
+    output:
+        fa=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa",
+        fai=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa.fai",
+        dictionary=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.dict"
+    resources:
+        mem_mb=MEM["reference_prepare"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.fa:q})"
+        ln -sfn {input.fa:q} {output.fa:q}
+        {TOOLS[samtools]:q} faidx {output.fa:q}
+        rm -f {output.dictionary:q}
+        {TOOLS[java]:q} -Xmx4g -jar {TOOLS[picard]:q} \
+            CreateSequenceDictionary R={output.fa:q} O={output.dictionary:q}
+        """
+
+
+# ============================================================
+# 5. Build BWA index
+# ============================================================
+rule bwa_index:
+    input:
+        fa=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa"
+    output:
+        amb=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.amb",
+        ann=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.ann",
+        bwt=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.bwt",
+        pac=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.pac",
+        sa=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.sa"
+    params:
+        prefix=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref"
+    threads: THREADS["bwa"]
+    resources:
+        mem_mb=MEM["bwa_index"]
+    shell:
+        """
+        mkdir -p "$(dirname {params.prefix:q})"
+        {TOOLS[bwa]:q} index -p {params.prefix:q} {input.fa:q}
+        """
+
+
+# ============================================================
+# 6. Build STAR index with species-specific GTF
+# ============================================================
+rule star_index:
+    input:
+        fa=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa",
+        gtf=lambda w: f"{REF_DIR}/{w.sp}.gtf"
+    output:
+        idx=directory(f"{WORK_DIR}/00_REF/STAR/{{sp}}")
+    params:
+        sjdb_overhang=STAR_CFG["sjdb_overhang"],
+        genome_ram=STAR_CFG["limit_genome_generate_ram"]
+    threads: THREADS["star"]
+    resources:
+        mem_mb=MEM["star_index"]
+    shell:
+        """
+        rm -rf {output.idx:q}
+        mkdir -p {output.idx:q}
+        {TOOLS[star]:q} --runMode genomeGenerate \
+            --runThreadN {threads} \
+            --genomeDir {output.idx:q} \
+            --genomeFastaFiles {input.fa:q} \
+            --sjdbGTFfile {input.gtf:q} \
+            --sjdbOverhang {params.sjdb_overhang} \
+            --limitGenomeGenerateRAM {params.genome_ram}
+        """
+
+
+# ============================================================
+# RNA WORKFLOW
+# ============================================================
+
+# 7. RNA BWA mapping
+rule bwa_map_rna:
+    input:
+        r1=f"{WORK_DIR}/00_QC/{{sp}}/RNA/{{sample_id}}/qc.R1.fastq.gz",
+        r2=f"{WORK_DIR}/00_QC/{{sp}}/RNA/{{sample_id}}/qc.R2.fastq.gz",
+        fai=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa.fai",
+        amb=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.amb",
+        ann=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.ann",
+        bwt=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.bwt",
+        pac=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.pac",
+        sa=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.sa"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/BWA/{{sample_id}}/{{sample_id}}.bam"
+    params:
+        idx=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref"
+    threads: THREADS["bwa"]
+    resources:
+        mem_mb=MEM["bwa_map"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.bam:q})"
+        {TOOLS[bwa]:q} mem -t {threads} -M \
+            -R '@RG\\tID:{wildcards.sample_id}\\tSM:{wildcards.sample_id}\\tLB:{wildcards.sample_id}' \
+            {params.idx:q} {input.r1:q} {input.r2:q} \
+        | awk '$3 != "*"' \
+        | {TOOLS[samtools]:q} view -b -S -t {input.fai:q} - \
+        > {output.bam:q}
+        """
+
+
+# 8. RNA BWA MAPQ >= 10 and coordinate sorting
+rule bwa_q10_rna:
+    input:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/BWA/{{sample_id}}/{{sample_id}}.bam"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/BWA/{{sample_id}}/{{sample_id}}.sort.q10.bam"
+    threads: THREADS["samtools_sort"]
+    shell:
+        """
+        {TOOLS[samtools]:q} view -bh -q 10 {input.bam:q} \
+        | {TOOLS[samtools]:q} sort -@ {threads} -o {output.bam:q} -
+        """
+
+
+# 9. Extract BWA alignment coordinates for refinement
+rule bwa_q10_aln:
+    input:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/BWA/{{sample_id}}/{{sample_id}}.sort.q10.bam"
+    output:
+        aln=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/BWA/{{sample_id}}/{{sample_id}}.bwa.q10.aln"
+    shell:
+        """
+        {TOOLS[samtools]:q} view {input.bam:q} \
+        | awk 'BEGIN{{OFS="\\t"}} $3 != "*" {{print $1,$2,$3,$4}}' \
+        > {output.aln:q}
+        """
+
+
+# 10. RNA STAR mapping
+rule star_map:
+    input:
+        r1=f"{WORK_DIR}/00_QC/{{sp}}/RNA/{{sample_id}}/qc.R1.fastq.gz",
+        r2=f"{WORK_DIR}/00_QC/{{sp}}/RNA/{{sample_id}}/qc.R2.fastq.gz",
+        index=f"{WORK_DIR}/00_REF/STAR/{{sp}}"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.bam"
+    params:
+        prefix=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}_",
+        aligned=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}_Aligned.sortedByCoord.out.bam",
+        tmp=f"{WORK_DIR}/tmp/STAR/{{sp}}/{{sample_id}}",
+        sort_ram=STAR_CFG["limit_bam_sort_ram"]
+    threads: THREADS["star"]
+    resources:
+        mem_mb=MEM["star_map"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.bam:q})"
+        mkdir -p "$(dirname {params.tmp:q})"
+        rm -rf {params.tmp:q}
+        {TOOLS[star]:q} --runThreadN {threads} \
+            --readFilesCommand zcat \
+            --outSAMtype BAM SortedByCoordinate \
+            --outReadsUnmapped Fastx \
+            --outFilterMultimapNmax 1 \
+            --outFilterMismatchNmax 10 \
+            --twopassMode Basic \
+            --limitBAMsortRAM {params.sort_ram} \
+            --genomeDir {input.index:q} \
+            --readFilesIn {input.r1:q} {input.r2:q} \
+            --outFileNamePrefix {params.prefix:q} \
+            --outSAMattrRGline ID:{wildcards.sample_id} SM:{wildcards.sample_id} \
+            --outTmpDir {params.tmp:q}
+        mv {params.aligned:q} {output.bam:q}
+        """
+
+
+# 11. RNA STAR MAPQ >= 10
+rule star_q10:
+    input:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.bam"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.q10.bam"
+    shell:
+        """
+        {TOOLS[samtools]:q} view -bh -q 10 {input.bam:q} \
+        > {output.bam:q}
+        """
+
+
+# 12. STAR-BWA refinement
+rule star_bwa_refine:
+    input:
+        star_q10=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.q10.bam",
+        bwa_aln=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/BWA/{{sample_id}}/{{sample_id}}.bwa.q10.aln"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.q10.refine.bam"
+    shell:
+        """
+        {TOOLS[samtools]:q} view -h {input.star_q10:q} \
+        | {TOOLS[perl]:q} {TOOLS[perl_extract]:q} {input.bwa_aln:q} - \
+        | {TOOLS[samtools]:q} view -bh - \
+        > {output.bam:q}
+        """
+
+
+# 13. RNA duplicate removal with Picard
+rule rna_markdup:
+    input:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.q10.refine.bam"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.q10.refine.nodup.bam",
+        metrics=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.metrics"
+    params:
+        tmp=f"{WORK_DIR}/tmp/Picard/{{sp}}/{{sample_id}}",
+        heap_g=int(MEM["picard"] / 1024)
+    resources:
+        mem_mb=MEM["picard"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.bam:q})"
+        mkdir -p {params.tmp:q}
+        {TOOLS[java]:q} -Xmx{params.heap_g}g \
+            -jar {TOOLS[picard]:q} MarkDuplicates \
+            TMP_DIR={params.tmp:q} \
+            INPUT={input.bam:q} \
+            OUTPUT={output.bam:q} \
+            METRICS_FILE={output.metrics:q} \
+            VALIDATION_STRINGENCY=SILENT \
+            ASSUME_SORTED=true \
+            CREATE_INDEX=true \
+            REMOVE_DUPLICATES=true
+        """
+
+
+# 14. GATK SplitNCigarReads for RNA
+rule rna_split:
+    input:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/STAR/{{sample_id}}/{{sample_id}}.sort.q10.refine.nodup.bam",
+        ref=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa",
+        fai=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa.fai",
+        dictionary=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.dict"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/final/{{sample_id}}/split.bam",
+        bai=f"{WORK_DIR}/01_MAP/{{sp}}/RNA/final/{{sample_id}}/split.bam.bai"
+    params:
+        tmp=f"{WORK_DIR}/tmp/GATK/{{sp}}/{{sample_id}}",
+        heap_g=int(MEM["gatk_split"] / 1024)
+    threads: THREADS["samtools_sort"]
+    resources:
+        mem_mb=MEM["gatk_split"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.bam:q})"
+        mkdir -p {params.tmp:q}
+        {TOOLS[java]:q} -Xmx{params.heap_g}g \
+            -Djava.io.tmpdir={params.tmp:q} \
+            -jar {TOOLS[gatk]:q} SplitNCigarReads \
+            -R {input.ref:q} \
+            -I {input.bam:q} \
+            -O {output.bam:q} \
+            --create-output-bam-index false
+        {TOOLS[samtools]:q} index -@ {threads} \
+            {output.bam:q} {output.bai:q}
+        """
+
+
+# ============================================================
+# DNA WORKFLOW
+# ============================================================
+
+# 15. DNA BWA mapping
+rule bwa_map_dna:
+    input:
+        r1=f"{WORK_DIR}/00_QC/{{sp}}/DNA/{{sample_id}}/qc.R1.fastq.gz",
+        r2=f"{WORK_DIR}/00_QC/{{sp}}/DNA/{{sample_id}}/qc.R2.fastq.gz",
+        fai=f"{WORK_DIR}/00_REF/GENOME/{{sp}}.fa.fai",
+        amb=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.amb",
+        ann=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.ann",
+        bwt=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.bwt",
+        pac=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.pac",
+        sa=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref.sa"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.bam"
+    params:
+        idx=f"{WORK_DIR}/00_REF/BWA/{{sp}}/ref"
+    threads: THREADS["bwa"]
+    resources:
+        mem_mb=MEM["bwa_map"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.bam:q})"
+        {TOOLS[bwa]:q} mem -t {threads} -M \
+            -R '@RG\\tID:{wildcards.sample_id}\\tSM:{wildcards.sample_id}\\tLB:{wildcards.sample_id}' \
+            {params.idx:q} {input.r1:q} {input.r2:q} \
+        | {TOOLS[samtools]:q} view -b -S -t {input.fai:q} - \
+        > {output.bam:q}
+        """
+
+
+# 16. DNA Sambamba sorting and indexing
+rule sambamba_sort_dna:
+    input:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.bam"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.sort.bam",
+        bai=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.sort.bam.bai"
+    params:
+        tmp=f"{WORK_DIR}/tmp/Sambamba/sort/{{sp}}/{{sample_id}}",
+        sort_memory=SAMBAMBA_CFG["sort_memory"]
+    threads: THREADS["sambamba"]
+    resources:
+        mem_mb=MEM["sambamba_sort"]
+    shell:
+        """
+        mkdir -p "$(dirname {output.bam:q})"
+        mkdir -p {params.tmp:q}
+        {TOOLS[sambamba]:q} sort \
+            -t {threads} -m {params.sort_memory} -p \
+            --tmpdir {params.tmp:q} \
+            -o {output.bam:q} {input.bam:q}
+        {TOOLS[sambamba]:q} index -t {threads} \
+            {output.bam:q} {output.bai:q}
+        """
+
+
+# 17. DNA Sambamba duplicate removal and indexing
+rule sambamba_markdup_dna:
+    input:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.sort.bam",
+        bai=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.sort.bam.bai"
+    output:
+        bam=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.nodup.bam",
+        bai=f"{WORK_DIR}/01_MAP/{{sp}}/DNA/{{sample_id}}/{{sample_id}}.nodup.bam.bai"
+    params:
+        tmp=f"{WORK_DIR}/tmp/Sambamba/markdup/{{sp}}/{{sample_id}}",
+        overflow=SAMBAMBA_CFG["overflow_list_size"]
+    threads: THREADS["sambamba"]
+    resources:
+        mem_mb=MEM["sambamba_sort"]
+    shell:
+        """
+        mkdir -p {params.tmp:q}
+        {TOOLS[sambamba]:q} markdup \
+            --overflow-list-size {params.overflow} \
+            -t {threads} -r \
+            --tmpdir {params.tmp:q} \
+            {input.bam:q} {output.bam:q}
+        {TOOLS[sambamba]:q} index -t {threads} \
+            {output.bam:q} {output.bai:q}
+        """

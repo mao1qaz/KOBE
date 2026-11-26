@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SOURCE_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd -P)"
+MAIN_SCRIPT="$SCRIPT_DIR/main.sh"
+
+SIF="${RNA_EDITING_SIF:-}"
+
+CDS_DIR=""
+EDIT_TXT_DIR=""
+WORK_DIR=""
+THREADS=8
+USER_BINDS=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ortho_edit \
+    --cds_dir DIR \
+    --edit_txt_dir DIR \
+    --work_dir DIR \
+    [--threads INT] \
+    [--sif FILE] \
+    [--bind DIR]
+
+Options:
+  --cds_dir       Directory containing *_longestcds.fasta files.
+  --edit_txt_dir  Directory containing *_candi_cds_sites.txt input files.
+  --work_dir      Output/working directory.
+  --threads INT   CPU thread budget for parallel steps (default: 8).
+  --sif FILE      Apptainer SIF image. Required unless RNA_EDITING_SIF is set.
+  --bind DIR Additional Apptainer bind mount. May be repeated.
+  -h, --help      Show this help message.
+
+Thread allocation:
+  Step 1: DIAMOND uses the requested INT threads.
+  Steps 2, 3 and 5: up to INT worker processes, one thread per process.
+  Step 4: up to floor(INT/2) MAFFT processes, two threads per process.
+          If INT=1, MAFFT uses one process with one thread.
+  Steps 6-11: serial.
+
+The launcher automatically binds the CDS directory, editing-site input
+directory, working directory, and script directory.
+
+Each run removes the workflow-generated output paths under WORK_DIR and
+rebuilds them from scratch. The input directories are not modified.
+
+Main log:
+  WORK_DIR/ortho_edit.log
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cds_dir)
+            [[ $# -ge 2 ]] || { echo "ERROR: --cds_dir requires a value" >&2; exit 1; }
+            CDS_DIR="$2"; shift 2 ;;
+        --edit_txt_dir)
+            [[ $# -ge 2 ]] || { echo "ERROR: --edit_txt_dir requires a value" >&2; exit 1; }
+            EDIT_TXT_DIR="$2"; shift 2 ;;
+        --work_dir)
+            [[ $# -ge 2 ]] || { echo "ERROR: --work_dir requires a value" >&2; exit 1; }
+            WORK_DIR="$2"; shift 2 ;;
+        --threads)
+            [[ $# -ge 2 ]] || { echo "ERROR: --threads requires a value" >&2; exit 1; }
+            THREADS="$2"; shift 2 ;;
+        --sif)
+            [[ $# -ge 2 ]] || { echo "ERROR: --sif requires a value" >&2; exit 1; }
+            SIF="$2"; shift 2 ;;
+        --bind)
+            [[ $# -ge 2 ]] || { echo "ERROR: --bind requires a value" >&2; exit 1; }
+            USER_BINDS+=("$2"); shift 2 ;;
+        -h|--help)
+            usage; exit 0 ;;
+        *)
+            echo "ERROR: Unknown option: $1" >&2
+            usage >&2
+            exit 1 ;;
+    esac
+done
+
+[[ -n "$CDS_DIR" ]] || { echo "ERROR: --cds_dir is required" >&2; exit 1; }
+[[ -n "$EDIT_TXT_DIR" ]] || { echo "ERROR: --edit_txt_dir is required" >&2; exit 1; }
+[[ -n "$WORK_DIR" ]] || { echo "ERROR: --work_dir is required" >&2; exit 1; }
+
+if ! [[ "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --threads must be a positive integer." >&2
+    exit 1
+fi
+
+[[ -d "$CDS_DIR" ]] || { echo "ERROR: CDS directory not found: $CDS_DIR" >&2; exit 1; }
+[[ -d "$EDIT_TXT_DIR" ]] || { echo "ERROR: Editing-site input directory not found: $EDIT_TXT_DIR" >&2; exit 1; }
+
+CDS_DIR="$(cd "$CDS_DIR" && pwd -P)"
+EDIT_TXT_DIR="$(cd "$EDIT_TXT_DIR" && pwd -P)"
+mkdir -p "$WORK_DIR"
+WORK_DIR="$(cd "$WORK_DIR" && pwd -P)"
+
+path_is_within() {
+    local parent="${1%/}"
+    local child="${2%/}"
+    [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
+}
+
+paths_overlap() {
+    path_is_within "$1" "$2" || path_is_within "$2" "$1"
+}
+
+if [[ "$WORK_DIR" == "/" || "$WORK_DIR" == "$HOME" ]]; then
+    echo "ERROR: Unsafe work directory: $WORK_DIR" >&2
+    exit 1
+fi
+
+for input_dir in "$CDS_DIR" "$EDIT_TXT_DIR"; do
+    if paths_overlap "$WORK_DIR" "$input_dir"; then
+        echo "ERROR: WORK_DIR must not be the same as, inside, or above an input directory." >&2
+        echo "WORK_DIR: $WORK_DIR" >&2
+        echo "Input:    $input_dir" >&2
+        exit 1
+    fi
+done
+
+[[ -s "$SIF" ]] || {
+    echo "ERROR: Apptainer image not found: $SIF" >&2
+    echo "Pass --sif FILE or set RNA_EDITING_SIF." >&2
+    exit 1
+}
+[[ -s "$MAIN_SCRIPT" ]] || { echo "ERROR: main.sh not found: $MAIN_SCRIPT" >&2; exit 1; }
+
+command -v apptainer >/dev/null 2>&1 || {
+    echo "ERROR: apptainer command not found. Activate/load Apptainer first." >&2
+    exit 1
+}
+
+LOG_FILE="$WORK_DIR/ortho_edit.log"
+exec > >(tee "$LOG_FILE") 2>&1
+
+echo "============================================================"
+echo "ORTHO_EDIT"
+echo "============================================================"
+echo "CDS directory:      $CDS_DIR"
+echo "Editing-site input: $EDIT_TXT_DIR"
+echo "Working directory:  $WORK_DIR"
+echo "Editing results:    $WORK_DIR/ortho_edit_result"
+echo "Thread budget:      $THREADS"
+echo "SIF:                $SIF"
+echo "Log:                $LOG_FILE"
+echo "============================================================"
+
+declare -a BIND_ARGS=()
+declare -A SEEN_BINDS=()
+
+add_auto_bind() {
+    local path="$1"
+    if [[ -z "${SEEN_BINDS[$path]+x}" ]]; then
+        BIND_ARGS+=(--bind "$path:$path")
+        SEEN_BINDS["$path"]=1
+    fi
+}
+
+add_auto_bind "$CDS_DIR"
+add_auto_bind "$EDIT_TXT_DIR"
+add_auto_bind "$WORK_DIR"
+add_auto_bind "$SCRIPT_DIR"
+
+# Resolve file symlinks contained in the two explicitly supplied input trees.
+# This scan is limited to those input directories; broad bind roots are never scanned.
+for input_dir in "$CDS_DIR" "$EDIT_TXT_DIR"; do
+    while IFS= read -r -d '' link_path; do
+        target_path="$(readlink -f -- "$link_path" 2>/dev/null || true)"
+        [[ -n "$target_path" ]] || continue
+        if [[ -d "$target_path" ]]; then
+            add_auto_bind "$target_path"
+        else
+            add_auto_bind "$(dirname "$target_path")"
+        fi
+    done < <(find "$input_dir" -type l -print0 2>/dev/null || true)
+done
+
+for bind_spec in "${USER_BINDS[@]}"; do
+    BIND_ARGS+=(--bind "$bind_spec")
+done
+
+if apptainer exec \
+    "${BIND_ARGS[@]}" \
+    "$SIF" \
+    bash "$MAIN_SCRIPT" \
+        --cds_dir "$CDS_DIR" \
+        --edit_txt_dir "$EDIT_TXT_DIR" \
+        --work_dir "$WORK_DIR" \
+        --threads "$THREADS"
+then
+    status=0
+else
+    status=$?
+fi
+
+echo
+echo "============================================================"
+if [[ "$status" -eq 0 ]]; then
+    echo "ortho_edit completed successfully."
+else
+    echo "ERROR: ortho_edit failed with exit code $status."
+fi
+echo "Log: $LOG_FILE"
+echo "============================================================"
+exit "$status"

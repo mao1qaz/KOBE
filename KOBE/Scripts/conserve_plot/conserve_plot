@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_container_runner.sh"
+
+ANNOTATED=""; CDS_DIR=""; OUT_DIR=""; SIF="${RNA_EDITING_SIF:-}"
+MIN_SPECIES=""; SPECIES_ORDER=""; SOURCE_PRIORITY=""; COL="8"
+GTF_ARGS=(); BIND_PATHS=("$SCRIPT_DIR")
+
+usage() {
+    cat <<'EOF'
+Usage:
+  conserve_plot --annotated FILE --cds_dir DIR --min_species INT \
+    --species_order STRING --outdir DIR --sif FILE \
+    [--source_priority STRING] [--gtf STRING ... (SPECIES=FILE)] [--col INT] [--bind DIR ...]
+
+All output files and conserve_plot.log are written under --outdir.
+GTF can be supplied repeatedly, one per species.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --annotated) ANNOTATED="$2"; BIND_PATHS+=("$2"); shift 2 ;;
+        --cds_dir) CDS_DIR="$2"; BIND_PATHS+=("$2"); shift 2 ;;
+        --outdir) OUT_DIR="$2"; shift 2 ;;
+        --sif) SIF="$2"; shift 2 ;;
+        --min_species) MIN_SPECIES="$2"; shift 2 ;;
+        --species_order) SPECIES_ORDER="$2"; shift 2 ;;
+        --source_priority) SOURCE_PRIORITY="$2"; shift 2 ;;
+        --col) COL="$2"; shift 2 ;;
+        --bind) BIND_PATHS+=("$2"); shift 2 ;;
+        --gtf)
+            GTF_ARGS+=(--gtf "$2")
+            GTF_PATH="${2#*=}"
+            BIND_PATHS+=("$GTF_PATH")
+            shift 2
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$ANNOTATED" || -z "$CDS_DIR" || -z "$OUT_DIR" || -z "$SIF" || -z "$MIN_SPECIES" || -z "$SPECIES_ORDER" ]]; then
+    echo "ERROR: Missing required arguments." >&2
+    usage >&2
+    exit 1
+fi
+
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/conserve_plot.log"
+BIND_PATHS+=("$OUT_DIR")
+
+CMD=(bash "$SCRIPT_DIR/main.sh" --annotated "$ANNOTATED" --cds_dir "$CDS_DIR" \
+    --outdir "$OUT_DIR" --min_species "$MIN_SPECIES" --species_order "$SPECIES_ORDER" --col "$COL")
+if [[ -n "$SOURCE_PRIORITY" ]]; then CMD+=(--source_priority "$SOURCE_PRIORITY"); fi
+CMD+=("${GTF_ARGS[@]}")
+
+run_in_container_logged "$SIF" "$LOG_FILE" "${BIND_PATHS[@]}" -- "${CMD[@]}"

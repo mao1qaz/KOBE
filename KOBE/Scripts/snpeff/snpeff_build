@@ -1,0 +1,444 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# SnpEff database builder
+#
+# Usage:
+#   snpeff_build \
+#       --gtf FILE \
+#       --genome FILE \
+#       --outdir DIR \
+#       --sif FILE \
+#       [--species STRING] \
+#       [--cores INT] \
+#       [--force]
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. Usage
+# ------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+Usage:
+  snpeff_build --gtf FILE --genome FILE --outdir DIR --sif FILE [--bind DIR ...] [options]
+
+Required:
+  --gtf FILE       Processed GTF file
+  --genome FILE    Genome FASTA file
+  --outdir DIR     Database output directory
+  --sif FILE       Apptainer SIF image
+
+Optional:
+  --species STRING Species identifier
+  --cores INT      CPU cores (default: 6)
+  --force          Force database rebuilding
+  --bind DIR Additional Apptainer bind; may be repeated
+  -h, --help       Show this help
+
+Species identification:
+  1. Explicit --species takes priority.
+  2. Otherwise, extract the prefix before _longestCDS.gtf
+     and compare it with the prefix before .fa/.fasta/.fna.
+  3. If the prefixes do not match, execution stops.
+
+Existing database:
+  1. Existing database is protected by default.
+  2. Use --force to rebuild an existing database.
+
+EOF
+}
+
+
+# ------------------------------------------------------------
+# 2. Initialize arguments
+# ------------------------------------------------------------
+
+GTF=""
+GENOME=""
+OUTDIR=""
+SIF="${RNA_EDITING_SIF:-}"
+SPECIES=""
+CORES=6
+FORCE=0
+declare -a USER_BINDS=()
+
+
+# ------------------------------------------------------------
+# 3. Validate option values
+# ------------------------------------------------------------
+
+require_value() {
+    if (($# < 2)) || [[ -z "${2:-}" || "$2" == --* ]]; then
+        echo "ERROR: $1 requires a value." >&2
+        exit 2
+    fi
+}
+
+
+# ------------------------------------------------------------
+# 4. Parse command-line arguments
+# ------------------------------------------------------------
+
+while (($#)); do
+
+    case "$1" in
+
+        --gtf)
+            require_value "$@"
+            GTF="$2"
+            shift 2
+            ;;
+
+        --genome|--fasta)
+            require_value "$@"
+            GENOME="$2"
+            shift 2
+            ;;
+
+        --outdir)
+            require_value "$@"
+            OUTDIR="$2"
+            shift 2
+            ;;
+
+        --sif)
+            require_value "$@"
+            SIF="$2"
+            shift 2
+            ;;
+
+        --species)
+            require_value "$@"
+            SPECIES="$2"
+            shift 2
+            ;;
+
+        --cores)
+            require_value "$@"
+            CORES="$2"
+            shift 2
+            ;;
+
+        --force)
+            FORCE=1
+            shift
+            ;;
+
+        --bind|-B)
+            require_value "$@"
+            USER_BINDS+=("$2")
+            shift 2
+            ;;
+
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        *)
+            echo "ERROR: Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+
+    esac
+
+done
+
+
+# ------------------------------------------------------------
+# 5. Check required arguments
+# ------------------------------------------------------------
+
+for name in GTF GENOME OUTDIR SIF; do
+
+    if [[ -z "${!name}" ]]; then
+        echo "ERROR: Missing required argument: $name" >&2
+        usage >&2
+        exit 2
+    fi
+
+done
+
+
+# ------------------------------------------------------------
+# 6. Validate input files
+# ------------------------------------------------------------
+
+for file in "$GTF" "$GENOME" "$SIF"; do
+
+    if [[ ! -f "$file" || ! -s "$file" || ! -r "$file" ]]; then
+        echo "ERROR: Missing, empty or unreadable file: $file" >&2
+        exit 1
+    fi
+
+done
+
+
+if [[ "$GTF" != *.gtf ]]; then
+    echo "ERROR: GTF input must have .gtf extension." >&2
+    exit 1
+fi
+
+
+case "$GENOME" in
+    *.fa|*.fasta|*.fna)
+        ;;
+    *)
+        echo "ERROR: Genome FASTA must end in .fa, .fasta or .fna." >&2
+        exit 1
+        ;;
+esac
+
+
+if [[ ! "$CORES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: Invalid CPU count: $CORES" >&2
+    exit 1
+fi
+
+
+# ------------------------------------------------------------
+# 7. Preserve original input filenames
+# ------------------------------------------------------------
+
+GTF_NAME=$(basename -- "$GTF")
+GENOME_NAME=$(basename -- "$GENOME")
+
+
+# ------------------------------------------------------------
+# 8. Resolve absolute input paths
+# ------------------------------------------------------------
+
+GTF=$(readlink -f -- "$GTF")
+GENOME=$(readlink -f -- "$GENOME")
+SIF=$(readlink -f -- "$SIF")
+
+
+# ------------------------------------------------------------
+# 9. Infer species identifier
+# ------------------------------------------------------------
+
+if [[ -z "$SPECIES" ]]; then
+
+    # Extract species from GTF filename.
+
+    if [[ "$GTF_NAME" == *_longestCDS.gtf ]]; then
+        GTF_SPECIES="${GTF_NAME%_longestCDS.gtf}"
+    else
+        echo "ERROR: Cannot infer species from GTF filename." >&2
+        echo "Expected format: species_longestCDS.gtf" >&2
+        echo "Please specify --species explicitly." >&2
+        exit 1
+    fi
+
+    # Extract species from FASTA filename.
+
+    case "$GENOME_NAME" in
+        *.fasta)
+            GENOME_SPECIES="${GENOME_NAME%.fasta}"
+            ;;
+        *.fna)
+            GENOME_SPECIES="${GENOME_NAME%.fna}"
+            ;;
+        *.fa)
+            GENOME_SPECIES="${GENOME_NAME%.fa}"
+            ;;
+        *)
+            echo "ERROR: Cannot infer species from FASTA filename." >&2
+            echo "Expected extension: .fa, .fasta or .fna" >&2
+            echo "Please specify --species explicitly." >&2
+            exit 1
+            ;;
+    esac
+
+    # Compare species prefixes.
+
+    if [[ -z "$GTF_SPECIES" || -z "$GENOME_SPECIES" ]]; then
+        echo "ERROR: Empty species prefix." >&2
+        echo "Please specify --species explicitly." >&2
+        exit 1
+    fi
+
+    if [[ "$GTF_SPECIES" != "$GENOME_SPECIES" ]]; then
+        echo "ERROR: GTF and FASTA species prefixes do not match." >&2
+        echo >&2
+        echo "GTF species:   $GTF_SPECIES" >&2
+        echo "FASTA species: $GENOME_SPECIES" >&2
+        echo >&2
+        echo "Please unify the input filenames or specify --species." >&2
+        exit 1
+    fi
+
+    SPECIES="$GTF_SPECIES"
+
+fi
+
+
+# ------------------------------------------------------------
+# 10. Validate species identifier
+# ------------------------------------------------------------
+
+if [[ ! "$SPECIES" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "ERROR: Invalid species identifier: $SPECIES" >&2
+    exit 1
+fi
+
+
+# ------------------------------------------------------------
+# 11. Prepare output directory
+# ------------------------------------------------------------
+
+mkdir -p -- "$OUTDIR"
+
+OUTDIR=$(cd -- "$OUTDIR" && pwd -P)
+
+
+# ------------------------------------------------------------
+# 11.1 Check existing SnpEff database
+# ------------------------------------------------------------
+
+DB_DIR="$OUTDIR/database/$SPECIES"
+DB="$DB_DIR/snpEffectPredictor.bin"
+
+if [[ "$FORCE" -eq 0 ]] && { [[ -e "$DB" ]] || [[ -L "$DB" ]]; }; then
+
+    echo "ERROR: SnpEff database already exists."
+    echo
+    echo "Species: $SPECIES"
+    echo "Database: $DB"
+    echo
+    echo "To rebuild this database, add --force."
+    echo "The existing database has not been modified."
+
+    exit 1
+
+fi
+
+
+# ------------------------------------------------------------
+# 12. Locate module scripts
+# ------------------------------------------------------------
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd -P)
+
+SNAKEFILE="$SCRIPT_DIR/Snakefile"
+CONFIG="$SCRIPT_DIR/config.yaml"
+
+for file in "$SNAKEFILE" "$CONFIG"; do
+
+    if [[ ! -s "$file" ]]; then
+        echo "ERROR: Required module file missing: $file" >&2
+        exit 1
+    fi
+
+done
+
+
+# ------------------------------------------------------------
+# 13. Check Apptainer
+# ------------------------------------------------------------
+
+if ! command -v apptainer >/dev/null 2>&1; then
+    echo "ERROR: Apptainer is unavailable." >&2
+    echo "Please activate the Apptainer environment." >&2
+    exit 1
+fi
+
+
+# ------------------------------------------------------------
+# 14. Prepare bind mounts
+# ------------------------------------------------------------
+
+declare -a BIND_ARGS=()
+declare -A BOUND_DIRS=()
+
+add_bind() {
+
+    local dir
+
+    dir=$(cd -- "$1" && pwd -P)
+
+    if [[ -z "${BOUND_DIRS[$dir]+x}" ]]; then
+        BOUND_DIRS["$dir"]=1
+        BIND_ARGS+=(--bind "$dir:$dir")
+    fi
+
+}
+
+add_bind "$SCRIPT_DIR"
+add_bind "$(dirname -- "$GTF")"
+add_bind "$(dirname -- "$GENOME")"
+add_bind "$OUTDIR"
+
+# Add user-requested mounts after automatic input/output mounts.
+for bind_spec in "${USER_BINDS[@]}"; do
+    bind_source="${bind_spec%%:*}"
+    [[ -d "$bind_source" ]] || {
+        echo "ERROR: Bind source directory not found: $bind_source" >&2
+        exit 1
+    }
+    BIND_ARGS+=(--bind "$bind_spec")
+done
+
+
+# ------------------------------------------------------------
+# 15. Configure Snakemake
+# ------------------------------------------------------------
+
+SNAKEMAKE="/opt/rna_editing/envs/snakemake/bin/snakemake"
+
+declare -a SMK_ARGS=(
+    -s "$SNAKEFILE"
+    --configfile "$CONFIG"
+    --cores "$CORES"
+    --rerun-incomplete
+    -p
+)
+
+
+# Force rebuilding when requested.
+
+if [[ "$FORCE" -eq 1 ]]; then
+    SMK_ARGS+=(--forcerun snpeff_build)
+fi
+
+
+# Pass module configuration.
+
+SMK_ARGS+=(
+    --config
+    "gtf=$GTF"
+    "fasta=$GENOME"
+    "result_dir=$OUTDIR"
+    "species=$SPECIES"
+)
+
+
+# ------------------------------------------------------------
+# 16. Execute SnpEff workflow inside Apptainer
+# ------------------------------------------------------------
+
+apptainer exec \
+    --cleanenv \
+    "${BIND_ARGS[@]}" \
+    --pwd "$SCRIPT_DIR" \
+    "$SIF" \
+    "$SNAKEMAKE" \
+    "${SMK_ARGS[@]}"
+
+
+# ------------------------------------------------------------
+# 17. Verify database
+# ------------------------------------------------------------
+
+if [[ ! -s "$DB" ]]; then
+    echo "ERROR: SnpEff database was not generated." >&2
+    echo "Expected database: $DB" >&2
+    exit 1
+fi

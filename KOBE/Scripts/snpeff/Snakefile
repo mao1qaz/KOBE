@@ -1,0 +1,220 @@
+
+import os
+import re
+import shlex
+
+C = config
+
+# =====================================================
+# Input configuration
+# =====================================================
+
+for key in ("gtf", "fasta", "result_dir"):
+    if not str(C.get(key, "")).strip():
+        raise ValueError(f"Missing required configuration: {key}")
+
+GTF = os.path.abspath(C["gtf"])
+FASTA = os.path.abspath(C["fasta"])
+RESULT_DIR = os.path.abspath(C["result_dir"])
+
+# Infer species from FASTA filename if not explicitly supplied.
+FASTA_NAME = os.path.basename(FASTA)
+
+SPECIES = str(C.get("species", "")).strip()
+
+if not SPECIES:
+    for suffix in (".fasta", ".fna", ".fa"):
+        if FASTA_NAME.lower().endswith(suffix):
+            SPECIES = FASTA_NAME[:-len(suffix)]
+            break
+
+if not SPECIES:
+    raise ValueError(
+        "Cannot infer species from FASTA filename. "
+        "Please specify species explicitly."
+    )
+
+if not re.fullmatch(r"[A-Za-z0-9_.-]+", SPECIES):
+    raise ValueError(f"Invalid species identifier: {SPECIES}")
+
+# =====================================================
+# Validate input files
+# =====================================================
+
+for label, path in [
+    ("GTF", GTF),
+    ("Genome FASTA", FASTA)
+]:
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise FileNotFoundError(f"Missing or empty {label}: {path}")
+
+# =====================================================
+# Output directories
+# =====================================================
+
+DATA_DIR = os.path.join(RESULT_DIR, "database")
+CONFIG_DIR = os.path.join(RESULT_DIR, "config")
+LOG_DIR = os.path.join(RESULT_DIR, "logs")
+
+SPECIES_DIR = os.path.join(DATA_DIR, SPECIES)
+
+DB_FILE = os.path.join(
+    SPECIES_DIR,
+    "snpEffectPredictor.bin"
+)
+
+SPECIES_CONFIG = os.path.join(
+    CONFIG_DIR,
+    f"{SPECIES}.config"
+)
+
+SEQUENCES_LINK = os.path.join(
+    SPECIES_DIR,
+    "sequences.fa"
+)
+
+GENES_LINK = os.path.join(
+    SPECIES_DIR,
+    "genes.gtf"
+)
+
+BUILD_LOG = os.path.join(
+    LOG_DIR,
+    f"{SPECIES}.build.log"
+)
+
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+# =====================================================
+# Container software
+# =====================================================
+
+JAR = C["jar"]
+BASE_CONFIG = C["base_config"]
+JAVA = C["java"]
+
+for label, path in [
+    ("SnpEff JAR", JAR),
+    ("SnpEff base config", BASE_CONFIG),
+    ("Java", JAVA)
+]:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+
+# =====================================================
+# Build parameters
+# =====================================================
+
+HEAP = C.get("heap", "8g")
+MEMORY_MB = int(C.get("memory_mb", 12000))
+
+BUILD_ARGS = C.get(
+    "build_args",
+    ["-gtf22", "-noCheckCds", "-noCheckProtein"]
+)
+
+if isinstance(BUILD_ARGS, str):
+    BUILD_ARGS = shlex.split(BUILD_ARGS)
+
+BUILD_ARGS = " ".join(
+    shlex.quote(str(x)) for x in BUILD_ARGS
+)
+
+# =====================================================
+# Workflow
+# =====================================================
+
+rule all:
+    input:
+        DB_FILE
+
+
+# =====================================================
+# Generate species-specific SnpEff config
+# =====================================================
+
+rule snpeff_config:
+    input:
+        base=BASE_CONFIG
+
+    output:
+        config=SPECIES_CONFIG
+
+    params:
+        key=f"{SPECIES}.genome",
+        genome=SPECIES
+
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p "$(dirname {output.config:q})"
+
+        awk -v key={params.key:q} -v val={params.genome:q} '
+            BEGIN {{ found=0 }}
+            $1 == key {{
+                if (!found) print key, ":", val
+                found=1
+                next
+            }}
+            {{ print }}
+            END {{ if (!found) print key, ":", val }}
+        ' {input.base:q} > {output.config:q}
+
+        test -s {output.config:q}
+        """
+
+
+# =====================================================
+# Build SnpEff database
+# =====================================================
+
+rule snpeff_build:
+    input:
+        fa=FASTA,
+        gtf=GTF,
+        config=SPECIES_CONFIG,
+        jar=JAR
+
+    output:
+        db=DB_FILE
+
+    params:
+        species=SPECIES,
+        species_dir=SPECIES_DIR,
+        sequences=SEQUENCES_LINK,
+        genes=GENES_LINK,
+        data_dir=DATA_DIR,
+        java=JAVA,
+        heap=HEAP,
+        build_args=BUILD_ARGS
+
+    threads: 1
+
+    resources:
+        mem_mb=MEMORY_MB
+
+    log:
+        BUILD_LOG
+
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p {params.species_dir:q}
+        mkdir -p {params.data_dir:q}
+        mkdir -p "$(dirname {log:q})"
+
+        ln -sfn {input.fa:q} {params.sequences:q}
+        ln -sfn {input.gtf:q} {params.genes:q}
+
+        {params.java:q} -Xmx{params.heap} \
+            -jar {input.jar:q} \
+            build {params.build_args} -v \
+            -c {input.config:q} \
+            -dataDir {params.data_dir:q} \
+            {params.species:q} \
+            > {log:q} 2>&1
+
+        test -s {output.db:q}
+        """

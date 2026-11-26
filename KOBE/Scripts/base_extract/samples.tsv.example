@@ -1,0 +1,4 @@
+sample_id	species	fq1	fq2	genome_fasta
+S_invicta_01	invicta	fastq/S_invicta_01_R1.fastq.gz	fastq/S_invicta_01_R2.fastq.gz	references/invicta.fa
+S_invicta_02	invicta	fastq/S_invicta_02_R1.fastq.gz	fastq/S_invicta_02_R2.fastq.gz	references/invicta.fa
+S_mellifera_01	mellifera	fastq/S_mellifera_01_R1.fastq.gz	fastq/S_mellifera_01_R2.fastq.gz	references/mellifera.fa

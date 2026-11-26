@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/container_runner.sh"
+
+SIF="${RNA_EDITING_SIF:-}"
+WORK_DIR=""
+SAMPLES=""
+SNPEFF_DIR=""
+CORES=""
+SNPEFF_JAR=""
+SNPEFF_JAVA=""
+declare -a SPECIES=()
+
+DNA_MIN_COVERAGE=10
+DNA_FDR=0.05
+RNA_MIN_COVERAGE=5
+RNA_FDR=0.05
+MIN_SUPPORT=2
+TOTAL_ERROR_RATE=0.005
+GENIC_MODE=c_numeric
+ACCEPT_SIMPLE_SNV=true
+FILTER_ONLY=false
+REANNOTATE=false
+MIN_BASE_QUALITY=30
+MPILEUP_OPTIONS="-u -v -t ADF,ADR"
+MPILEUP_MEMORY_MB=12000
+SNPEFF_OPTIONS="-canon -ud 0 -v -nodownload -noLog"
+SNPEFF_HEAP=8g
+SNPEFF_MEMORY_MB=12000
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  denovo_detect_anno --work-dir DIR --samples FILE --cores INT \
+    [--snpeff-dir DIR] [--species STRING] \
+    [--dna-min-coverage INT] [--dna-fdr FLOAT] [--rna-min-coverage INT] [--rna-fdr FLOAT] \
+    [--min-support INT] [--total-error-rate FLOAT] \
+    [--filter-only | --reannotate] [--sif FILE] [--bind DIR ...]
+
+Required:
+  --work-dir DIR              Module 01 work directory (contains 00_REF and 01_MAP)
+  --samples FILE              Same samples.tsv used by denovo_detect_map
+  --cores INT                 Total Snakemake CPU limit
+  --snpeff-dir DIR             Root of prebuilt SnpEff databases (contains database/ and config/). Required when annotation must run, including a first annotation run, missing annotated VCFs, or --reannotate. Not needed with --filter-only or when all selected-species annotated VCFs already exist.
+
+Optional:
+  --species STRING             Species identifiers to analyze; repeatable and comma-separated. If omitted, all species in samples.tsv are selected.
+  --dna-min-coverage INT      Minimum DNA coverage (default: 10)
+  --dna-fdr FLOAT             DNA FDR threshold (default: 0.05)
+  --rna-min-coverage INT      Minimum RNA coverage (default: 5)
+  --rna-fdr FLOAT             RNA FDR threshold (default: 0.05)
+  --min-support INT           Minimum independent RNA sample_id libraries (default: 2)
+  --total-error-rate FLOAT    Total sequencing error rate (default: 0.005)
+  --filter-only                Reuse existing candidate tables and run only threshold filtering/export; does not require --snpeff-dir.
+  --reannotate                 Force SnpEff annotation and candidate extraction, then run downstream filtering; requires --snpeff-dir.
+  --genic-mode STRING          Genic extraction mode (default: c_numeric)
+  --accept-simple-snv          Enable simple-SNV acceptance (default enabled)
+  --no-accept-simple-snv        Disable simple-SNV acceptance
+  --min-base-quality INT       mpileup minimum base quality (default: 30)
+  --mpileup-options STRING     mpileup options (default: '-u -v -t ADF,ADR')
+  --mpileup-memory-mb INT      mpileup memory request in MB (default: 12000)
+  --snpeff-options STRING      SnpEff options (default: '-canon -ud 0 -v -nodownload -noLog')
+  --snpeff-heap STRING         SnpEff Java heap (default: 8g)
+  --snpeff-memory-mb INT       SnpEff memory request in MB (default: 12000)
+  --snpeff-jar FILE            Override container SnpEff JAR
+  --snpeff-java FILE           Override container Java 25 launcher
+  --sif FILE                   Apptainer image; alternatively set RNA_EDITING_SIF
+  --bind DIR    Additional bind; may be repeated
+
+The threshold filename tag retains the established five fields:
+DNA coverage, RNA coverage, minimum RNA support, DNA FDR, and RNA FDR.
+Total error rate is recorded in the run parameters/log but is not part of the tag.
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
+fi
+
+require_host_tools
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --work-dir) WORK_DIR="$2"; shift 2 ;;
+        --samples) SAMPLES="$2"; shift 2 ;;
+        --snpeff-dir) SNPEFF_DIR="$2"; shift 2 ;;
+        --cores) CORES="$2"; shift 2 ;;
+        --species) SPECIES+=("$2"); shift 2 ;;
+        --dna-min-coverage) DNA_MIN_COVERAGE="$2"; shift 2 ;;
+        --dna-fdr) DNA_FDR="$2"; shift 2 ;;
+        --rna-min-coverage) RNA_MIN_COVERAGE="$2"; shift 2 ;;
+        --rna-fdr) RNA_FDR="$2"; shift 2 ;;
+        --min-support) MIN_SUPPORT="$2"; shift 2 ;;
+        --total-error-rate) TOTAL_ERROR_RATE="$2"; shift 2 ;;
+        --genic-mode) GENIC_MODE="$2"; shift 2 ;;
+        --accept-simple-snv) ACCEPT_SIMPLE_SNV=true; shift ;;
+        --no-accept-simple-snv) ACCEPT_SIMPLE_SNV=false; shift ;;
+        --filter-only) FILTER_ONLY=true; shift ;;
+        --reannotate) REANNOTATE=true; shift ;;
+        --min-base-quality) MIN_BASE_QUALITY="$2"; shift 2 ;;
+        --mpileup-options) MPILEUP_OPTIONS="$2"; shift 2 ;;
+        --mpileup-memory-mb) MPILEUP_MEMORY_MB="$2"; shift 2 ;;
+        --snpeff-options) SNPEFF_OPTIONS="$2"; shift 2 ;;
+        --snpeff-heap) SNPEFF_HEAP="$2"; shift 2 ;;
+        --snpeff-memory-mb) SNPEFF_MEMORY_MB="$2"; shift 2 ;;
+        --snpeff-jar) SNPEFF_JAR="$2"; shift 2 ;;
+        --snpeff-java) SNPEFF_JAVA="$2"; shift 2 ;;
+        --sif) SIF="$2"; shift 2 ;;
+        --bind|-B) add_user_bind "$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$WORK_DIR" || -z "$SAMPLES" || -z "$CORES" ]]; then
+    echo "ERROR: --work-dir, --samples and --cores are required." >&2
+    usage >&2
+    exit 1
+fi
+if [[ -z "$SIF" || ! -s "$SIF" ]]; then
+    echo "ERROR: Provide --sif FILE or set RNA_EDITING_SIF to the RNA editing SIF." >&2
+    exit 1
+fi
+SIF="$(absolute_path "$SIF")"
+if [[ "$FILTER_ONLY" == true && "$REANNOTATE" == true ]]; then
+    echo "ERROR: --filter-only and --reannotate cannot be used together." >&2
+    exit 1
+fi
+
+WORK_DIR="$(absolute_path "$WORK_DIR")"
+SAMPLES="$(absolute_path "$SAMPLES")"
+[[ -d "$WORK_DIR" ]] || { echo "ERROR: Work directory not found: $WORK_DIR" >&2; exit 1; }
+[[ -s "$SAMPLES" ]] || { echo "ERROR: Sample table not found: $SAMPLES" >&2; exit 1; }
+[[ "$CORES" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --cores must be a positive integer." >&2; exit 1; }
+
+if [[ -n "$SNPEFF_DIR" ]]; then
+    SNPEFF_DIR="$(absolute_path "$SNPEFF_DIR")"
+    [[ -d "$SNPEFF_DIR" ]] || { echo "ERROR: SnpEff directory not found: $SNPEFF_DIR" >&2; exit 1; }
+fi
+if [[ "$REANNOTATE" == true && -z "$SNPEFF_DIR" ]]; then
+    echo "ERROR: --snpeff-dir is required with --reannotate." >&2
+    exit 1
+fi
+if [[ -n "$SNPEFF_JAR" ]]; then SNPEFF_JAR="$(absolute_path "$SNPEFF_JAR")"; fi
+if [[ -n "$SNPEFF_JAVA" ]]; then SNPEFF_JAVA="$(absolute_path "$SNPEFF_JAVA")"; fi
+
+# Determine selected species from the sample table if the user did not specify them.
+SPECIES_CSV=""
+if ((${#SPECIES[@]})); then
+    for item in "${SPECIES[@]}"; do
+        item="${item//,/ }"
+        for sp in $item; do
+            [[ -n "$sp" ]] || continue
+            if [[ -n "$SPECIES_CSV" ]]; then SPECIES_CSV+=","; fi
+            SPECIES_CSV+="$sp"
+        done
+    done
+else
+    SPECIES_CSV="$(python3 - "$SAMPLES" <<'PY'
+import csv
+import sys
+seen=[]
+with open(sys.argv[1], encoding="utf-8-sig", newline="") as handle:
+    reader=csv.DictReader(handle, delimiter="\t")
+    if not reader.fieldnames or "species" not in reader.fieldnames:
+        raise SystemExit("ERROR: samples.tsv requires a species column")
+    for row in reader:
+        sp=(row.get("species") or "").strip()
+        if sp and sp not in seen: seen.append(sp)
+print(",".join(seen))
+PY
+)"
+fi
+[[ -n "$SPECIES_CSV" ]] || { echo "ERROR: No species selected/found in samples.tsv." >&2; exit 1; }
+
+# The work directory is already the Mapping output root. Create annotation result
+# roots on the host so they are writable inside the container.
+mkdir -p "$WORK_DIR/02_anno" "$WORK_DIR/edit_site_result"
+add_bind_for_path "$SCRIPT_DIR"
+add_bind_for_path "$WORK_DIR"
+add_bind_for_path "$SAMPLES"
+if [[ -n "$SNPEFF_DIR" ]]; then
+    add_bind_for_path "$SNPEFF_DIR"
+    add_symlink_targets_in_dir "$SNPEFF_DIR"
+fi
+if [[ -n "$SNPEFF_JAR" ]]; then add_bind_for_path "$SNPEFF_JAR"; fi
+if [[ -n "$SNPEFF_JAVA" ]]; then add_bind_for_path "$SNPEFF_JAVA"; fi
+
+if [[ "$FILTER_ONLY" == true ]]; then
+    IFS=',' read -r -a SELECTED_SPECIES <<< "$SPECIES_CSV"
+    for sp in "${SELECTED_SPECIES[@]}"; do
+        for region in genic intergenic; do
+            candidate="$WORK_DIR/02_anno/$sp/$region.candidates.tsv"
+            [[ -s "$candidate" ]] || {
+                echo "ERROR: --filter-only requires existing candidate table: $candidate" >&2
+                exit 1
+            }
+        done
+    done
+else
+    PATH_LIST="$(mktemp)"
+    trap 'rm -f "$PATH_LIST"' EXIT
+    if ! collect_annotation_sample_paths "$SAMPLES" "$WORK_DIR" > "$PATH_LIST"; then
+        exit 1
+    fi
+    while IFS= read -r -d '' input_path; do
+        add_bind_for_path "$input_path"
+    done < "$PATH_LIST"
+    add_symlink_targets_in_dir "$WORK_DIR/00_REF/GENOME"
+fi
+
+LOG_FILE="$WORK_DIR/denovo_detect_anno.log"
+: > "$LOG_FILE"
+{
+    echo "Command: denovo_detect_anno"
+    echo "Work directory: $WORK_DIR"
+    echo "Samples: $SAMPLES"
+    echo "Species: $SPECIES_CSV"
+    echo "Thresholds: DNA coverage=$DNA_MIN_COVERAGE; DNA FDR=$DNA_FDR; RNA coverage=$RNA_MIN_COVERAGE; RNA FDR=$RNA_FDR; min support=$MIN_SUPPORT; total error rate=$TOTAL_ERROR_RATE"
+    echo "Mode: filter_only=$FILTER_ONLY; reannotate=$REANNOTATE"
+    echo "Snakemake cores: $CORES"
+} >> "$LOG_FILE"
+
+CONFIG_ARGS=(
+    "work_dir=$WORK_DIR"
+    "samples_tsv=$SAMPLES"
+    "snpeff_dir=$SNPEFF_DIR"
+    "species=$SPECIES_CSV"
+    "dna_min_coverage=$DNA_MIN_COVERAGE"
+    "dna_fdr=$DNA_FDR"
+    "rna_min_coverage=$RNA_MIN_COVERAGE"
+    "rna_fdr=$RNA_FDR"
+    "min_support=$MIN_SUPPORT"
+    "total_error_rate=$TOTAL_ERROR_RATE"
+    "genic_mode=$GENIC_MODE"
+    "accept_simple_snv=$ACCEPT_SIMPLE_SNV"
+    "filter_only=$FILTER_ONLY"
+    "reannotate=$REANNOTATE"
+    "min_base_quality=$MIN_BASE_QUALITY"
+    "mpileup_options=$MPILEUP_OPTIONS"
+    "mpileup_memory_mb=$MPILEUP_MEMORY_MB"
+    "snpeff_options=$SNPEFF_OPTIONS"
+    "snpeff_heap=$SNPEFF_HEAP"
+    "snpeff_memory_mb=$SNPEFF_MEMORY_MB"
+)
+if [[ -n "$SNPEFF_JAR" ]]; then CONFIG_ARGS+=("snpeff_jar=$SNPEFF_JAR"); fi
+if [[ -n "$SNPEFF_JAVA" ]]; then CONFIG_ARGS+=("snpeff_java=$SNPEFF_JAVA"); fi
+
+CMD=(snakemake -s "$SCRIPT_DIR/02_Snakefile" --cores "$CORES" --rerun-incomplete -p)
+if [[ "$FILTER_ONLY" == true ]]; then
+    CMD+=(--allowed-rules all filter_and_plot_region export_final_edit_sites summarize_variant_type_proportions)
+fi
+if [[ "$REANNOTATE" == true ]]; then
+    CMD+=(--forcerun snpeff_annotate extract_regions_prefilter)
+fi
+CMD+=(--config "${CONFIG_ARGS[@]}")
+run_in_container_logged "$SIF" "$LOG_FILE" "${CMD[@]}"
